@@ -67,11 +67,38 @@ JavaScript.html     # <script> block only
 
 ## UX Intent
 
-Two views, one record panel:
+### Roles
 
-- **Program view** — 12-month grid for the selected year; primary orientation for leadership. Each month cell lists the third parties scheduled in it. `Not Applicable` records are shown but muted so they don't pollute workload signals. Month-level counts and any headcount/workload summaries exclude `Not Applicable`.
-- **Roster view** — full list of all third parties, filterable by status and region. This is where reviewers scan and manage the universe. `Not Applicable` records are always included — hiding them would defeat the purpose of maintaining the universe.
-- **Record panel** — opens from either view; covers all TP fields plus an inline LOB table for managing lines of business. When status is `Not Applicable`, the `notes` field should be the most prominent editable element — it is the discovery log and the only place to capture why the record was flagged (contract end date, last activity, etc.).
+| Role | Access |
+|---|---|
+| **Manager** | All modules including User Management. Multiple managers are allowed — there is no single owner. |
+| **Reviewer** | Program view, Roster, and individual record editing. No access to User Management or user administration. |
+
+### Modules
+
+**Executive Summary**
+High-level read-only dashboard oriented toward leadership. Surfaces KPI cards and chart artifacts: total universe size, assessments scheduled vs. completed for the current year, `Not Applicable` count, and coverage gaps. Managers and Reviewers can view; only the data layer drives it — no manual input.
+
+**Analytics**
+Dedicated data visualization section with the following breakouts, each rendered as a chart artifact:
+- **By Region** — assessment distribution across reviewer regions (NA · LATAM · EMEA · APAC)
+- **By Quarter** — Q1/Q2/Q3/Q4 volume and completion rate for the selected year
+- **By Month** — month-by-month scheduled vs. completed assessments for the selected year
+- **By Status** — distribution across all status values; `Not Applicable` is always shown as its own segment, never folded into other categories, so leadership can track universe hygiene over time
+
+All Analytics charts exclude `Not Applicable` from workload metrics (headcount, completion rate) but include them in universe-size and trend counts.
+
+**Program View**
+12-month grid for the selected year — primary planning surface for leadership. Each month cell lists scheduled third parties. `Not Applicable` records appear muted and do not count toward monthly totals or headcount signals.
+
+**Roster**
+Full third party list, filterable by status and region. The operational surface for reviewers managing the universe. `Not Applicable` records are always visible — hiding them would undermine universe accuracy.
+
+**Record Panel**
+Opens from Program View or Roster. Covers all TP fields plus the inline LOB table. When status is `Not Applicable`, the `notes` field is the most prominent editable element — it serves as the discovery log (contract end date, last known activity, finding rationale).
+
+**User Management**
+Manager-only. Manages the list of app users and their role assignments (Manager / Reviewer). Minimum viable: add user by email, assign role, remove access.
 
 ## Hard Rules
 
