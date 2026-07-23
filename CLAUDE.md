@@ -41,6 +41,9 @@ JavaScript.html     # <script> block only
 | J | `notes` | free text |
 | K | `created_at` | ISO timestamp |
 | L | `updated_at` | ISO timestamp |
+| M | `business_owner` | Internal relationship owner / business unit sponsor (email or display name) |
+| N | `assessment_type` | Questionnaire · Document Review · On-Site Audit · Continuous Monitoring |
+| O | `applicable_frameworks` | comma-separated (SOX · HIPAA · PCI DSS · GDPR · DORA · ISO 27001 · SIG · VSAQ · etc.) |
 
 ### LinesOfBusiness sheet — one row per LOB per third party
 
@@ -77,7 +80,7 @@ JavaScript.html     # <script> block only
 ### Modules
 
 **Executive Summary**
-High-level read-only dashboard oriented toward leadership. Surfaces KPI cards and chart artifacts: total universe size, assessments scheduled vs. completed for the current year, `Not Applicable` count, and coverage gaps. Managers and Reviewers can view; only the data layer drives it — no manual input.
+High-level read-only dashboard oriented toward leadership. Surfaces KPI cards and chart artifacts: total universe size, assessments scheduled vs. completed for the current year, `Not Applicable` count, coverage gaps, and regulatory framework coverage (count of vendors tagged per framework, derived from `applicable_frameworks`). Managers and Reviewers can view; only the data layer drives it — no manual input.
 
 **Analytics**
 Dedicated data visualization section with the following breakouts, each rendered as a chart artifact:
@@ -92,15 +95,25 @@ All Analytics charts exclude `Not Applicable` from workload metrics (headcount, 
 12-month grid for the selected year — primary planning surface for leadership. Each month cell lists scheduled third parties. `Not Applicable` records appear muted and do not count toward monthly totals or headcount signals.
 
 **Roster**
-Full third party list, filterable by status and region. The operational surface for reviewers managing the universe. `Not Applicable` records are always visible — hiding them would undermine universe accuracy.
+Full third party list, filterable by status, region, business owner, and applicable frameworks. The operational surface for reviewers managing the universe. `Not Applicable` records are always visible — hiding them would undermine universe accuracy.
 
 **Record Panel**
-Opens from Program View or Roster. Covers all TP fields plus the inline LOB table. When status is `Not Applicable`, the `notes` field is the most prominent editable element — it serves as the discovery log (contract end date, last known activity, finding rationale).
+Opens from Program View or Roster. Covers all TP fields plus the inline LOB table. Key fields:
+- `business_owner` — displayed prominently alongside `lead_reviewer`; represents the internal sponsor accountable for the relationship, distinct from the assessor.
+- `assessment_type` — dropdown (Questionnaire · Document Review · On-Site Audit · Continuous Monitoring); drives scope and effort expectations for the assessment cycle.
+- `applicable_frameworks` — multi-select or comma-separated tag input; captures which regulatory or assessment frameworks govern this vendor (SOX, HIPAA, PCI DSS, GDPR, DORA, ISO 27001, SIG, VSAQ, etc.); used for coverage mapping in Executive Summary.
+
+When status is `Not Applicable`, the `notes` field is the most prominent editable element — it serves as the discovery log (contract end date, last known activity, finding rationale).
 
 **User Management**
 Manager-only. Manages the list of app users and their role assignments (Manager / Reviewer). Minimum viable: add user by email, assign role, remove access.
 
 ## Hard Rules
+
+**Authentication**
+- Identity is resolved server-side via `Session.getActiveUser().getEmail()` — never trust anything passed from the client.
+- On every request that requires a role check, call this first, look up the email in the Users sheet, and return `{ success: false, error: 'Unauthorized' }` before doing any work if the role is insufficient.
+- User Management writes (add/remove/reassign) must also verify the caller is a Manager before executing.
 
 **Sheets access**
 - Always `SpreadsheetApp.openById(id)` — never `getActiveSpreadsheet()` (breaks in web app context).
