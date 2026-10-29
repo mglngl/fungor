@@ -1,0 +1,373 @@
+<!DOCTYPE html>
+<!--
+  README.html: implementation manual for the TPRM Assessment Planner.
+
+  This file is documentation only. Nothing in the app loads it (doGet serves Index, and Index only
+  includes Fonts, Stylesheet and JavaScript). Do not add template scriptlets to it.
+
+  Since v9 the public include() helper only serves Fonts, Stylesheet and JavaScript, so this file is not
+  reachable from the web app. Still keep it free of secrets: never paste spreadsheet IDs, user e-mails,
+  deployment URLs or credentials into it.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>TPRM Assessment Planner: Implementation Manual</title>
+<style>
+  body { font-family: system-ui, -apple-system, "Segoe UI", Roboto, Arial, sans-serif; max-width: 960px; margin: 32px auto; padding: 0 20px; color: #111; line-height: 1.55; }
+  h1 { font-size: 26px; margin-bottom: 4px; }
+  h2 { font-size: 20px; margin-top: 40px; border-bottom: 1px solid #ddd; padding-bottom: 4px; }
+  h3 { font-size: 16px; margin-top: 24px; }
+  code, pre { font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 13px; background: #f4f4f5; border-radius: 4px; }
+  code { padding: 1px 4px; }
+  pre { padding: 12px; overflow-x: auto; }
+  table { border-collapse: collapse; width: 100%; margin: 12px 0; font-size: 14px; }
+  th, td { border: 1px solid #ddd; padding: 6px 8px; text-align: left; vertical-align: top; }
+  th { background: #f4f4f5; }
+  .note { background: #fff8e6; border-left: 4px solid #e0a800; padding: 10px 14px; margin: 14px 0; }
+  .ok { background: #eef8f0; border-left: 4px solid #2e8b57; padding: 10px 14px; margin: 14px 0; }
+  .muted { color: #666; font-size: 14px; }
+  ol li, ul li { margin: 4px 0; }
+</style>
+</head>
+<body>
+
+<h1>TPRM Assessment Planner: Implementation Manual</h1>
+<p class="muted">Audience: whoever deploys and runs the app. Covers moving from the personal-account sandbox to the
+production Google Workspace (verizon.com) environment. App UI version label: v0.26.8. Code baseline: sandbox deployment v9.</p>
+
+<h2>Contents</h2>
+<ol>
+  <li><a href="#overview">Overview</a></li>
+  <li><a href="#environments">Environments: sandbox vs production</a></li>
+  <li><a href="#prereqs">Before you start: Workspace prerequisites</a></li>
+  <li><a href="#access">Choose the access model</a></li>
+  <li><a href="#files">Project files</a></li>
+  <li><a href="#setup">Production setup, step by step</a></li>
+  <li><a href="#properties">Script Properties</a></li>
+  <li><a href="#database">The database spreadsheet</a></li>
+  <li><a href="#users">User management and access control</a></li>
+  <li><a href="#changes">Shipping code changes</a></li>
+  <li><a href="#migration">Moving data from the sandbox (optional)</a></li>
+  <li><a href="#ops">Operations and troubleshooting</a></li>
+  <li><a href="#security">Security notes and known limitations</a></li>
+  <li><a href="#history">Version history (sandbox)</a></li>
+</ol>
+
+<h2 id="overview">1. Overview</h2>
+<p>A single-page web app for planning third-party risk assessments. It has four modules for everyone (Executive Summary,
+Analytics, Program View, Roster) and one Manager-only module (User Management).</p>
+<ul>
+  <li><b>Stack:</b> Google Apps Script backend (<code>.gs</code>) plus an HtmlService frontend (<code>.html</code>), with a Google Sheet as the database.</li>
+  <li><b>Data flow:</b> browser → <code>google.script.run</code> → top-level <code>.gs</code> functions → Google Sheets. There is no REST API.</li>
+  <li><b>Identity:</b> resolved only on the server with <code>Session.getActiveUser().getEmail()</code>. The browser never asserts a role.</li>
+  <li><b>Authorization:</b> every public server function calls <code>authorize_()</code> first, which looks the caller up in the <b>Users</b> tab.
+      User Management is the single source of truth for who gets in and with which role (Manager or Reviewer).</li>
+  <li><b>Database location:</b> the spreadsheet ID lives in the Script Property <code>SPREADSHEET_ID</code>. It is never hardcoded.
+      The Roster subtitle shows the live value.</li>
+  <li><b>Server contract:</b> every server function returns <code>{success, data}</code> or <code>{success:false, error}</code>.
+      Public functions that write take a script lock (<code>LockService</code>) for the whole transaction.</li>
+  <li><b>No external resources:</b> the fonts (Geist) are embedded in <code>Fonts.html</code> as data URIs. There are no CDNs.</li>
+  <li><b>Scopes:</b> <code>spreadsheets</code> and <code>userinfo.email</code> only. There are no libraries, no Advanced Services and no <code>UrlFetchApp</code>.</li>
+</ul>
+
+<h2 id="environments">2. Environments: sandbox vs production</h2>
+<table>
+  <tr><th></th><th>Sandbox (current)</th><th>Production (target)</th></tr>
+  <tr><td>Account</td><td>Personal @gmail.com account</td><td>A verizon.com Google Workspace account</td></tr>
+  <tr><td>Purpose</td><td>Non-production. Demo data allowed.</td><td>Real assessment data. No demo data.</td></tr>
+  <tr><td>Who can use it</td><td>Any Google account listed in User Management</td><td>verizon.com accounts listed in User Management</td></tr>
+  <tr><td>Execute as</td><td>User accessing the web app (needed on personal accounts, which hide visitor e-mails otherwise)</td><td>See <a href="#access">section 4</a>. "Me" is recommended.</td></tr>
+  <tr><td>Who has access</td><td>Anyone with Google account</td><td>Anyone within verizon.com</td></tr>
+  <tr><td>Spreadsheet sharing</td><td>Shared automatically with every listed user</td><td>Depends on the access model (section 4)</td></tr>
+</table>
+<p>The production environment is a <b>new, separate</b> project and spreadsheet. Nothing is linked to the sandbox, so the sandbox
+can stay as a test bed for future changes.</p>
+
+<h2 id="prereqs">3. Before you start: Workspace prerequisites</h2>
+<p>Corporate Workspace tenants often restrict Apps Script. Confirm these with the Verizon Google Workspace administrators
+<b>before</b> building anything:</p>
+<ol>
+  <li><b>Apps Script is enabled</b> for the deploying account's organizational unit.</li>
+  <li><b>Web app deployment</b> with access "Anyone within verizon.com" is permitted.</li>
+  <li><b>OAuth scopes:</b> the app requests <code>https://www.googleapis.com/auth/spreadsheets</code> and
+      <code>https://www.googleapis.com/auth/userinfo.email</code>. If API Controls restrict third-party or internal apps,
+      the admins may need to mark the script's OAuth client as trusted. Some tenants also require a standard
+      (non-default) Google Cloud project; if so, attach it under Project Settings → Google Cloud Platform (GCP) Project before
+      the first authorization.</li>
+  <li><b>Data classification:</b> confirm that third-party risk data may be stored in a Google Sheet in the deploying account's
+      Drive, and that this sharing model meets the data-handling policy.</li>
+  <li><b>Deploying account:</b> decide which account owns the project and the spreadsheet. Prefer a long-lived team or
+      service-style account over an individual's account, so the app is not tied to one person's employment.
+      The owner is the first Manager and always keeps full edit rights to the spreadsheet.</li>
+  <li><b>Where the database lives:</b> My Drive or a shared drive both work (since v9). <code>setupDatabase()</code> always creates
+      it in the deploying account's My Drive. To use a shared drive, <b>move</b> it there afterwards. A move keeps the
+      file ID, so <code>SPREADSHEET_ID</code> stays valid; a copy gets a new ID that must be entered in Script Properties. Moving it
+      needs permission to add files to that shared drive, and the tenant's settings must allow the move. Files owned by a personal account
+      usually can't be moved into a Verizon shared drive. See <a href="#shared-drive">section 8, "Database in a shared drive"</a>.</li>
+</ol>
+
+<h2 id="access">4. Choose the access model</h2>
+<p>Inside one Workspace domain, Google discloses each visitor's e-mail even when the app runs as its owner.
+That makes a stricter model possible than the one the sandbox needed.</p>
+<table>
+  <tr><th></th><th>Model A: Execute as Me (recommended)</th><th>Model B: Execute as User accessing</th></tr>
+  <tr><td>Manifest <code>webapp</code></td><td><code>"executeAs": "USER_DEPLOYING", "access": "DOMAIN"</code></td><td><code>"executeAs": "USER_ACCESSING", "access": "DOMAIN"</code></td></tr>
+  <tr><td>Who reads and writes the spreadsheet</td><td>The owner's account, for every user</td><td>Each user's own account</td></tr>
+  <tr><td>Spreadsheet sharing</td><td>Not needed. The spreadsheet can stay private to the owner.</td><td>Required. Every user must be an editor.</td></tr>
+  <tr><td>Can users bypass the app?</td><td>No, if the spreadsheet stays private</td><td>Yes, for the ThirdParties and LinesOfBusiness tabs (direct edits)</td></tr>
+  <tr><td>First visit</td><td>No consent prompt for users</td><td>Each user approves the scopes once</td></tr>
+  <tr><td>Script Property</td><td><code>SHARE_DATABASE_WITH_USERS = false</code></td><td>Leave it unset (sharing on)</td></tr>
+</table>
+<div class="ok">
+  <b>Model A needs one Script Property:</b> <code>SHARE_DATABASE_WITH_USERS</code> = <code>false</code> (section 7). With it, User
+  Management stops sharing the spreadsheet with each user and revokes any share it made earlier, so the spreadsheet is reachable
+  only through the app. The Users and Config protections are still managed. Without the property, sharing stays on, which is what
+  Model B and the personal-account sandbox need.
+</div>
+
+<h2 id="files">5. Project files</h2>
+<p>The editor names must match exactly, because <code>Index.html</code> calls <code>include('Fonts')</code>,
+<code>include('Stylesheet')</code> and <code>include('JavaScript')</code>.</p>
+<table>
+  <tr><th>File</th><th>Purpose</th></tr>
+  <tr><td><code>appsscript.json</code></td><td>Manifest: time zone, V8 runtime, OAuth scopes, web app settings. Set <code>webapp</code> for your access model (section 4) and the <code>timeZone</code> your team works in.</td></tr>
+  <tr><td><code>Code.gs</code></td><td>Web-app entry points: <code>doGet()</code>, <code>include()</code> (serves only Fonts, Stylesheet and JavaScript), and <code>getInitialData()</code>, the single call that loads the UI, including the live <code>SPREADSHEET_ID</code>.</td></tr>
+  <tr><td><code>Config.gs</code></td><td>Sheet names, column headers, default dropdown values, rename maps, and the one-time setup functions <code>setupDatabase()</code> and <code>initializeSheets()</code>.</td></tr>
+  <tr><td><code>DB.gs</code></td><td>Data-access layer: opens the spreadsheet by ID, does bulk reads and writes, applies text formats, runs header checks and migrations, takes the script lock, and builds the return envelopes.</td></tr>
+  <tr><td><code>Users.gs</code></td><td>Identity, role checks (<code>authorize_</code>), User Management functions, and <code>syncAccess_()</code>, which handles spreadsheet sharing and tab protections.</td></tr>
+  <tr><td><code>ThirdParties.gs</code></td><td>Third-party create, update and delete, plus server-side validation of every field.</td></tr>
+  <tr><td><code>LinesOfBusiness.gs</code></td><td>Line-of-business rows saved together with their third party.</td></tr>
+  <tr><td><code>Seed.gs</code></td><td>Optional demo data (31 sample vendors). <b>Leave it out of production</b>, or never run it there.</td></tr>
+  <tr><td><code>Index.html</code></td><td>Page shell that includes the three files below.</td></tr>
+  <tr><td><code>Fonts.html</code></td><td>Embedded Geist fonts. Optional: deleting it, along with its <code>include('Fonts')</code> line, falls back to system fonts.</td></tr>
+  <tr><td><code>Stylesheet.html</code></td><td>Design tokens and component styles.</td></tr>
+  <tr><td><code>JavaScript.html</code></td><td>The whole frontend: state, rendering, views, record panel and server calls.</td></tr>
+  <tr><td><code>README.html</code></td><td>This manual. Documentation only; nothing loads it.</td></tr>
+</table>
+
+<h2 id="setup">6. Production setup, step by step</h2>
+<p>Sign in to Chrome with the verizon.com deploying account first. Use a separate Chrome profile, so the personal sandbox account
+can't be picked by mistake.</p>
+<ol>
+  <li><b>Create the project.</b> Go to <code>script.google.com</code> → New project and rename it, for example "TPRM Assessment Planner".</li>
+  <li><b>Show the manifest.</b> Go to Project Settings → tick "Show 'appsscript.json' manifest file in editor".</li>
+  <li><b>Add the files</b> listed in section 5 with exact names: Script files Code, Config, DB, Users, ThirdParties, LinesOfBusiness;
+      HTML files Index, Fonts, Stylesheet, JavaScript, README. Paste each file's content <b>whole and unmodified</b>,
+      replacing the editor's default text. Skip Seed.gs in production.</li>
+  <li><b>Set the manifest</b> <code>webapp</code> block for the chosen access model (section 4) and set <code>timeZone</code>.
+      <b>For Model A</b>, also add the Script Property <code>SHARE_DATABASE_WITH_USERS</code> = <code>false</code> now
+      (Project Settings → Script Properties), before running setup.</li>
+  <li><b>Save</b> (Ctrl+S). Open each file and check that there are no red error markers.</li>
+  <li><b>Create the database.</b> Select <code>setupDatabase</code> in the function list (Config.gs) → Run → approve the
+      authorization prompt. This:
+      <ul>
+        <li>creates the spreadsheet "TPRM Assessment Planner — Database" in the owner's My Drive;</li>
+        <li>stores its ID in the Script Property <code>SPREADSHEET_ID</code>;</li>
+        <li>creates the ThirdParties, LinesOfBusiness, Config and Users tabs with their headers;</li>
+        <li>fills Config with the default dropdown values;</li>
+        <li>registers the account that ran it as the first <b>Manager</b>;</li>
+        <li>protects the Users and Config tabs.</li>
+      </ul>
+      The Execution log only shows "Execution completed". Confirm success with the next step.</li>
+  <li><b>Verify.</b> Check that Project Settings → Script Properties shows <code>SPREADSHEET_ID</code>. Open the spreadsheet
+      (Drive → "TPRM Assessment Planner — Database") and check:
+      <ul>
+        <li>the four tabs exist;</li>
+        <li>ThirdParties has 20 headers (A–T);</li>
+        <li>Users has exactly one row, the owner, as Manager;</li>
+        <li>Users and Config show a padlock.</li>
+      </ul></li>
+  <li><b>Deploy.</b> Go to Deploy → New deployment → type "Web app" and set:
+      <ul>
+        <li>Description: "v1";</li>
+        <li>Execute as: per the model;</li>
+        <li>Who has access: <b>Anyone within verizon.com</b>.</li>
+      </ul>
+      Click Deploy and copy the <code>/exec</code> URL. Store that URL in your team's runbook, not in this file.</li>
+  <li><b>Smoke test as the owner.</b> Open the /exec URL and check:
+      <ul>
+        <li>all modules render;</li>
+        <li>Roster shows the spreadsheet ID as its subtitle;</li>
+        <li>adding, editing and deleting a test third party updates the ThirdParties tab;</li>
+        <li>dark mode survives a reload.</li>
+      </ul></li>
+  <li><b>Add users</b> in User Management with their exact verizon.com e-mail and role. Then have one Reviewer and one more
+      Manager sign in and confirm what each can see and do.</li>
+</ol>
+
+<h2 id="properties">7. Script Properties</h2>
+<table>
+  <tr><th>Property</th><th>Value</th><th>Notes</th></tr>
+  <tr><td><code>SPREADSHEET_ID</code></td><td>ID of the database spreadsheet</td><td>Set automatically by <code>setupDatabase()</code>.
+      Change it under Project Settings → Script Properties → Edit script properties to point the app at another spreadsheet.
+      That spreadsheet must already have the expected tabs and headers; run <code>initializeSheets()</code> afterwards.
+      The change takes effect on the next page load, or within about a minute in an open tab. No redeploy is needed.
+      <b>Never delete this property</b>: the next caller of <code>setupDatabase()</code> would create a new database it owns.</td></tr>
+  <tr><td><code>SHARE_DATABASE_WITH_USERS</code></td><td><code>false</code>, or leave it unset</td><td>Set to <code>false</code> for Model A (Execute as Me):
+      the spreadsheet is not shared with users, and earlier app-made shares are revoked at the next user change or
+      <code>initializeSheets()</code> run. Unset, or any other value, keeps sharing on, as Model B and the sandbox require.
+      <b>Don't set it to false under Model B</b>: users would lose the spreadsheet access the app needs to run as them.</td></tr>
+  <tr><td><code>APP_SHARED_EDITORS</code></td><td>Maintained by the app</td><td>JSON list of the accounts the app itself shared the
+      spreadsheet with. It lets the app revoke exactly its own shares, which matters in a shared drive. <b>Don't edit or delete it.</b></td></tr>
+</table>
+
+<h2 id="database">8. The database spreadsheet</h2>
+<p>Column order in the <code>*_HEADERS</code> arrays (Config.gs) is the source of truth. Don't reorder, insert or rename columns
+by hand. New columns are appended on the right, and renames go through the rename maps (see "Schema changes" below).
+Every column except <code>headcount</code> is stored as plain text, so values such as <code>2026-03</code> or <code>4.1</code>
+are never turned into dates or numbers.</p>
+<h3>ThirdParties (A–T)</h3>
+<table>
+  <tr><th>Col</th><th>Header</th><th>Meaning and format</th></tr>
+  <tr><td>A</td><td><code>tp_id</code></td><td>TP-0001… assigned by the server</td></tr>
+  <tr><td>B</td><td><code>name</code></td><td>Required</td></tr>
+  <tr><td>C</td><td><code>alternate_name</code></td><td>Optional</td></tr>
+  <tr><td>D</td><td><code>assessment_month_year</code></td><td>YYYY-MM (text)</td></tr>
+  <tr><td>E</td><td><code>status</code></td><td>One of the Config <code>status</code> values</td></tr>
+  <tr><td>F</td><td><code>lead_reviewer</code></td><td>Free text</td></tr>
+  <tr><td>G</td><td><code>regions</code></td><td>Comma-separated Config <code>region</code> values. Labelled "Regions" in the UI; renamed from <code>reviewer_region</code> in v7.</td></tr>
+  <tr><td>H</td><td><code>tp_locations</code></td><td>Free text</td></tr>
+  <tr><td>I</td><td><code>headcount</code></td><td>Whole number (the only numeric column)</td></tr>
+  <tr><td>J</td><td><code>notes</code></td><td>Free text. Used as the discovery log when the status is Not Applicable.</td></tr>
+  <tr><td>K–L</td><td><code>created_at</code>, <code>updated_at</code></td><td>ISO timestamps set by the server</td></tr>
+  <tr><td>M</td><td><code>business_owner</code></td><td>Free text</td></tr>
+  <tr><td>N</td><td><code>assessment_type</code></td><td>One of the Config <code>assessment_type</code> values</td></tr>
+  <tr><td>O</td><td><code>applicable_frameworks</code></td><td>Comma-separated</td></tr>
+  <tr><td>P</td><td><code>vra_number</code></td><td>Optional text</td></tr>
+  <tr><td>Q</td><td><code>completed_date</code></td><td>Optional YYYY-MM-DD; impossible dates are rejected</td></tr>
+  <tr><td>R</td><td><code>region_lead</code></td><td>Optional; exactly one Config <code>region</code> value</td></tr>
+  <tr><td>S</td><td><code>supplier_type</code></td><td>Optional; one Config <code>supplier_type</code> value</td></tr>
+  <tr><td>T</td><td><code>infosec_version</code></td><td>Optional; one Config <code>infosec_version</code> value</td></tr>
+</table>
+<h3>Other tabs</h3>
+<ul>
+  <li><b>LinesOfBusiness:</b> <code>lob_id</code>, <code>tp_id</code>, <code>line_of_business</code>, <code>service_description</code>, <code>vendor_manager</code>.
+      Rows are removed together with their third party.</li>
+  <li><b>Users:</b> <code>email</code>, <code>first_name</code>, <code>last_name</code>, <code>role</code> (Manager or Reviewer), <code>added_at</code>.
+      Protected; edit it through User Management only.</li>
+  <li><b>Config:</b> <code>config_key</code>, <code>config_value</code>, with one row per dropdown option. Protected. The keys are:
+      <code>status</code>, <code>region</code> (NA, LATAM, EMEA, APAC, US), <code>assessment_type</code>, <code>framework</code>, <code>role</code>,
+      <code>supplier_type</code> (Tier 1, TPD, SaaS, Logistics, Tier 2, Review, Tier 1 OR, VIS, TF Project, Frontier) and
+      <code>infosec_version</code> (4.1, 4.2).</li>
+</ul>
+<h3 id="shared-drive">Database in a shared drive</h3>
+<ul>
+  <li>A <b>move</b> into a shared drive keeps the file ID, so nothing changes in Script Properties. Run <code>initializeSheets()</code> once afterwards.</li>
+  <li>Google reports <b>no owner</b> for shared-drive files. The app then:
+      <ul>
+        <li>leaves access that comes from <b>shared drive membership</b> alone, because that belongs to the drive's managers;</li>
+        <li>still adds or revokes the per-file shares it made itself (tracked in <code>APP_SHARED_EDITORS</code>);</li>
+        <li>still manages the Users and Config protections.</li>
+      </ul></li>
+  <li><b>Shared drive members can edit the spreadsheet directly</b>, including people who aren't in User Management, and Users/Config
+      protections aside. Keep the drive's membership to the people who administer the app, or keep the database in the owner's
+      My Drive with Model A.</li>
+  <li>First-time setup (no Manager yet) is refused in a shared drive, because there is no owner to recognise. Always create the database
+      with <code>setupDatabase()</code> first, then move it.</li>
+</ul>
+<h3>Changing dropdown options</h3>
+<p>The app reads options from the Config tab, and the order of the rows is the order shown in the UI. To <b>add</b> an option,
+add a row (Manager or owner). To <b>retire</b> one, remove it from <b>both</b> the Config tab and
+<code>DEFAULT_CONFIG</code> in Config.gs: <code>initializeSheets()</code> re-adds any default value that is missing from the sheet.
+Records that already use a retired value keep it, but they can't be saved until it is changed to a valid option.</p>
+<h3>Schema changes</h3>
+<ul>
+  <li><b>New column:</b> append the key to the end of <code>TP_HEADERS</code> (or the relevant array), deploy, then run
+      <code>initializeSheets()</code>. It writes the missing headers on the right without moving any data.</li>
+  <li><b>Renamed column or Config key:</b> add the mapping to <code>HEADER_RENAMES</code> or <code>CONFIG_KEY_RENAMES</code>, then
+      run <code>initializeSheets()</code>. It rewrites the old name in place and keeps the data.</li>
+  <li><code>initializeSheets()</code> can be run again safely at any time. It never deletes or reorders data, and it stops with a clear
+      error if a header doesn't match.</li>
+</ul>
+
+<h2 id="users">9. User management and access control</h2>
+<ul>
+  <li><b>Managers</b> can use every module, including User Management, and can hard-delete third parties.
+      <b>Reviewers</b> can use Executive Summary, Analytics, Program View and Roster, and can create and edit records.</li>
+  <li>At least one Manager must always remain; the server refuses to remove or demote the last one.</li>
+  <li>Adding, editing or removing a user (and every <code>initializeSheets()</code> run) runs <code>syncAccess_()</code>, which:
+      <ul>
+        <li>with sharing on (Model B, sandbox), shares the spreadsheet with every listed user;</li>
+        <li>always protects the Users and Config tabs so only Managers and the owner can edit them directly;</li>
+        <li>revokes access User Management no longer grants. In My Drive that means every editor or viewer not listed; in a shared drive,
+            only the app's own shares. With sharing off (Model A), every share the app made earlier is revoked. The owner is never touched.</li>
+      </ul>
+      If part of the sync fails, for example an address that isn't a Google account, the rest still runs and the message lists what couldn't be done.</li>
+  <li>Someone not listed sees "You don't have access yet". If Google withholds a visitor's e-mail, they see an explanation instead.
+      In a Workspace domain this should only happen to accounts outside verizon.com.</li>
+  <li>The Manager/Reviewer toggle in the top bar only <i>previews</i> the Reviewer view. The server always enforces the real role.</li>
+</ul>
+
+<h2 id="changes">10. Shipping code changes</h2>
+<ol>
+  <li>Make and test the change in the <b>sandbox</b> first.</li>
+  <li>In production, paste the changed files <b>whole</b> into the editor and save. The live app keeps running the previous
+      version until you deploy.</li>
+  <li>If the change touches columns or Config keys, run <code>initializeSheets()</code> <b>before</b> deploying (section 8).</li>
+  <li>Go to Deploy → Manage deployments → select the active deployment → Edit (pencil) → Version: <b>New version</b>. Add a description,
+      check that "Execute as" and "Who has access" are unchanged, and click Deploy. The <code>/exec</code> URL stays the same.</li>
+  <li>To roll back, Edit the deployment and pick an earlier version. For a staging check before deploying,
+      Deploy → Test deployments gives a <code>/dev</code> URL that always runs the latest saved code (owner and editors only).</li>
+</ol>
+
+<h2 id="migration">11. Moving data from the sandbox (optional)</h2>
+<p>Production normally starts empty. If sandbox records must move over:</p>
+<ol>
+  <li>Set up production completely (section 6) so that its headers exist.</li>
+  <li>In the sandbox spreadsheet, copy the data rows (not the header row) of ThirdParties and LinesOfBusiness.</li>
+  <li>In production, paste with <b>Paste special → Values only</b>, starting at row 2, columns A–T and A–E. Keep the
+      <code>tp_id</code> and <code>lob_id</code> values as they are, so LinesOfBusiness rows still point to their third party.</li>
+  <li>Do <b>not</b> copy Users or Config. Add the production users through User Management.</li>
+  <li>Reload the app and spot-check a few records in the Roster and the record panel.</li>
+</ol>
+<div class="note">The sandbox's demo vendors (TP-0001 to TP-0031) are fictional. Leave them behind.</div>
+
+<h2 id="ops">12. Operations and troubleshooting</h2>
+<table>
+  <tr><th>Symptom</th><th>Likely cause and fix</th></tr>
+  <tr><td>"You don't have access yet"</td><td>The account isn't listed in User Management, or it is signed in with a different Google account. Under Model B, the user may not have edit access to the spreadsheet yet. Re-save the user to re-run the sync. Check that <code>SHARE_DATABASE_WITH_USERS</code> isn't <code>false</code> under Model B.</td></tr>
+  <tr><td>"The user list was saved, but database sharing could not be fully updated: …"</td><td>The listed items failed and everything else was applied. Typical causes: an address that isn't a Google account, a shared drive that blocks sharing with non-members, or a tenant sharing policy. Fix the cause and re-save the user, or run <code>initializeSheets()</code>.</td></tr>
+  <tr><td>"Google did not share your account email…"</td><td>The visitor is signed in with an account outside verizon.com, or the browser has several accounts and a non-Workspace one is active.</td></tr>
+  <tr><td>"Sorry, unable to open the file at this time"</td><td>Google blocked the visit before the app loaded. Check the deployment's "Who has access" and that the visitor uses a verizon.com account.</td></tr>
+  <tr><td>"SPREADSHEET_ID is not set…"</td><td>The Script Property is missing. Restore it to the existing database's ID. Don't run <code>setupDatabase()</code>, which would create a new, empty database.</td></tr>
+  <tr><td>"Sheet … has an unexpected header…"</td><td>Someone edited a header row by hand. Restore the header named in the message, then run <code>initializeSheets()</code>.</td></tr>
+  <tr><td>"The system is busy"</td><td>Another save held the script lock for over 30 seconds. Retry.</td></tr>
+  <tr><td>A save is rejected with "Invalid …"</td><td>The value isn't in the Config tab, for example a retired dropdown option. Pick a valid option, or add it back to Config.</td></tr>
+</table>
+<p>Server errors are logged to Cloud Logging (<code>exceptionLogging: STACKDRIVER</code>) and appear under the project's
+<b>Executions</b> page.</p>
+
+<h2 id="security">13. Security notes and known limitations</h2>
+<ul>
+  <li><b><code>include()</code> is allow-listed</b> (since v9) to Fonts, Stylesheet and JavaScript, which the browser receives anyway.
+      Any other name, including README and Index, is refused. If you add a page part that Index includes, add its name to
+      <code>INCLUDABLE_FILES_</code> in Code.gs.</li>
+  <li><b>Model B only:</b> every listed user is an editor of the spreadsheet, so they can edit the ThirdParties and LinesOfBusiness
+      tabs directly, outside the app's validation and role rules. Model A with <code>SHARE_DATABASE_WITH_USERS = false</code> closes this.</li>
+  <li><b>Shared drive:</b> drive members have direct edit access that the app doesn't manage (section 8).</li>
+  <li><b>Demoting yourself:</b> a Manager who demotes themselves stays on the Users and Config protection list until another
+      user change runs the sync. Google doesn't let an account remove itself from a protection in the same action.</li>
+  <li><b>Owner:</b> the spreadsheet owner can always edit everything. Plan an ownership hand-over if that person changes role.</li>
+  <li><b>Seed.gs</b> loads demo data into an empty roster when a Manager runs it. Keep it out of production.</li>
+  <li><b>Browser storage:</b> only the dark-mode preference is kept in the browser (<code>localStorage</code>). No business data is cached there.</li>
+</ul>
+
+<h2 id="history">14. Version history (sandbox)</h2>
+<table>
+  <tr><th>Deployment</th><th>Change</th></tr>
+  <tr><td>v1</td><td>Initial deployment of the original 13-file codebase (owner-only access).</td></tr>
+  <tr><td>v2</td><td>Removed the Proof of Concept module (a duplicate of Roster).</td></tr>
+  <tr><td>v3</td><td>User Management became the single source of truth for access: automatic spreadsheet sharing, protected admin tabs,
+      clear message when identity is unavailable; runs as the user accessing it.</td></tr>
+  <tr><td>v4</td><td>Removed the Data Import &amp; Merge module from the UI.</td></tr>
+  <tr><td>v5</td><td>Removed Import.gs, the ImportLog tab and all import-only code and styles.</td></tr>
+  <tr><td>v6</td><td>New roster fields: VRA number, Completed date, Region lead, Supplier type, InfoSec version. Added the US region.</td></tr>
+  <tr><td>v7</td><td>Region lead uses the region options (single choice). "Reviewer regions" renamed to "Regions" (<code>regions</code> column, <code>region</code> Config key).</td></tr>
+  <tr><td>v8</td><td>The Roster subtitle shows the live <code>SPREADSHEET_ID</code> from Script Properties.</td></tr>
+  <tr><td>v9</td><td>Pre-production hardening: <code>SHARE_DATABASE_WITH_USERS</code> switch for Model A; shared-drive support (no-owner handling,
+      the app revokes only its own shares, tracked in <code>APP_SHARED_EDITORS</code>); the sync reports partial failures; <code>include()</code> allow-list.</td></tr>
+</table>
+
+</body>
+</html>

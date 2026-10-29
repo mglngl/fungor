@@ -1,0 +1,1363 @@
+<script>
+(function () {
+'use strict';
+
+/* =====================================================================================================
+ * 1. UTILITIES
+ * ===================================================================================================== */
+const ESC_MAP = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' };
+/** HTML-escape any value for text or attribute positions. */
+const esc = (s) => String(s == null ? '' : s).replace(/[&<>"']/g, (c) => ESC_MAP[c]);
+/** Always an array (templates iterate with list(x).map(...)). */
+const list = (a) => (Array.isArray(a) ? a : []);
+const clone = (o) => JSON.parse(JSON.stringify(o));
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const pad2 = (n) => String(n).padStart(2, '0');
+
+/** localStorage is per-viewer and can be blocked — always optional. */
+function store(key, value) {
+  try {
+    if (value === undefined) return window.localStorage.getItem(key);
+    window.localStorage.setItem(key, value);
+  } catch (e) { /* storage unavailable: ignore */ }
+  return null;
+}
+
+/* =====================================================================================================
+ * 2. CONSTANTS
+ * ===================================================================================================== */
+/**
+ * The design is a fixed 1180×820 "tablet" workspace centred on a desk-coloured page and scaled to fit the window.
+ *   fit: true  → exactly as in index.html
+ *   fit: false → the workspace fills the whole browser window (full-bleed)
+ */
+const WORKSPACE = { width: 1180, height: 820, fit: true, deskShade: '#f0f0f0' };
+const TOAST_MS = 2200;
+const AUTO_REFRESH_MS = 60000;
+
+const MONTHS = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'];
+const STATUS_DOTS = {
+  'Planned': 'var(--chart-1)', 'In Progress': 'var(--chart-2)', 'Completed': 'var(--chart-5)',
+  'On Hold': 'var(--muted-foreground)', 'Cancelled': 'var(--neutral-600)', 'Not Applicable': 'var(--neutral-300)'
+};
+const statusDot = (st) => STATUS_DOTS[st] || 'var(--muted-foreground)';
+
+/** Fallback dropdown values; the live values come from the Config sheet via getInitialData(). */
+const DEFAULT_CFG = {
+  status: ['Planned', 'In Progress', 'Completed', 'On Hold', 'Cancelled', 'Not Applicable'],
+  region: ['NA', 'LATAM', 'EMEA', 'APAC', 'US'],
+  assessment_type: ['Questionnaire', 'Document Review', 'On-Site Audit', 'Continuous Monitoring'],
+  framework: ['SOX', 'HIPAA', 'PCI DSS', 'GDPR', 'DORA', 'ISO 27001', 'SIG', 'VSAQ', 'SOC 2', 'NIST CSF'],
+  role: ['Manager', 'Reviewer'],
+  supplier_type: ['Tier 1', 'TPD', 'SaaS', 'Logistics', 'Tier 2', 'Review', 'Tier 1 OR', 'VIS', 'TF Project', 'Frontier'],
+  infosec_version: ['4.1', '4.2']
+};
+
+const VIEW_TITLES = {
+  exec: ['Executive Summary', 'read-only · driven entirely by the data layer'],
+  analytics: ['Analytics', 'workload metrics exclude Not Applicable; universe counts include it'],
+  program: ['Program View', '12-month planning surface for leadership'],
+  roster: ['Roster', ''], // subtitle = the live SPREADSHEET_ID (see renderVals)
+  users: ['User Management', 'manager-only · add users by email and assign roles'],
+};
+const MANAGER_ONLY_VIEWS = ['users'];
+
+/* =====================================================================================================
+ * 3. STATE  (single object; every change goes through setState() → render())
+ * ===================================================================================================== */
+const S = {
+  boot: 'loading',          // loading | ready | denied | error
+  bootError: '',
+  me: null,                 // { email, first, last, full, initials, role } — resolved by the server
+  cfg: clone(DEFAULT_CFG),
+  dark: store('tprm.dark') === '1',
+  view: 'exec',
+  viewAs: 'Manager',        // Managers can preview the Reviewer experience; the server still enforces the real role
+  year: new Date().getFullYear(),
+  scale: 1,
+
+  tps: [], lobs: [], users: [], tpsStamp: 0, loadedAt: 0,
+
+  panelOpen: false, draft: null, draftErr: '', deleteArmed: false, busy: false,
+  userErr: '', userPanelOpen: false, userDraft: null, userDraftErr: '',
+  newUserEmail: '', newUserFirst: '', newUserLast: '', newUserRole: 'Reviewer',
+  filters: { q: '', status: 'All statuses', region: 'All regions', owner: 'All owners', fw: 'All frameworks' },
+  sort: { key: 'month', dir: 1 },
+  savedMsg: ''
+};
+
+function setState(patch) {
+  Object.assign(S, patch);
+  render();
+}
+
+/* =====================================================================================================
+ * 4. SERVER BRIDGE — google.script.run, promisified. Never rejects: always resolves {success,...}.
+ * ===================================================================================================== */
+function api(fn) {
+  const args = Array.prototype.slice.call(arguments, 1);
+  return new Promise((resolve) => {
+    try {
+      const runner = window.google.script.run
+        .withSuccessHandler((res) => resolve(res && typeof res === 'object' ? res : { success: false, error: 'Empty response from server.' }))
+        .withFailureHandler((err) => resolve({ success: false, error: (err && err.message) || String(err) }));
+      runner[fn].apply(runner, args);
+    } catch (e) {
+      resolve({ success: false, error: (e && e.message) || String(e) });
+    }
+  });
+}
+
+/* =====================================================================================================
+ * 5. RENDERER — string templates → DOM patch ("morph"), so focus, caret, scroll positions, hover state and
+ *    CSS entrance animations survive every state change (a plain innerHTML swap would reset all of them).
+ * ===================================================================================================== */
+let appEl = null;
+
+function render() {
+  if (!appEl) return;
+  const html = S.boot === 'ready' ? buildApp(renderVals()) : buildBootState();
+  const tpl = document.createElement('template');
+  tpl.innerHTML = html;
+  morphChildren(appEl, tpl.content);
+  // freshly inserted <select>s have no morph pass: apply their data-value once everything is in the DOM
+  Array.prototype.forEach.call(appEl.querySelectorAll('select[data-value]'), (sel) => {
+    const v = sel.getAttribute('data-value');
+    if (sel.value !== v && Array.prototype.some.call(sel.options, (o) => o.value === v)) sel.value = v;
+  });
+}
+
+function morphChildren(from, to) {
+  const next = Array.prototype.slice.call(to.childNodes);
+  for (let i = 0; i < next.length; i++) {
+    const a = from.childNodes[i];
+    if (!a) from.appendChild(next[i]);
+    else morphNode(a, next[i]);
+  }
+  while (from.childNodes.length > next.length) from.removeChild(from.lastChild);
+}
+
+function morphNode(a, b) {
+  if (a.nodeType !== b.nodeType || a.nodeName !== b.nodeName) { a.parentNode.replaceChild(b, a); return; }
+  if (a.nodeType === 3 || a.nodeType === 8) { if (a.nodeValue !== b.nodeValue) a.nodeValue = b.nodeValue; return; }
+  if (a.nodeType !== 1) return;
+  patchAttrs(a, b);
+  if (a.nodeName === 'TEXTAREA') { if (a.value !== b.value) a.value = b.value; return; }
+  morphChildren(a, b);
+  if (a.nodeName === 'INPUT') syncInput(a, b);
+  else if (a.nodeName === 'SELECT') syncSelect(a, b);
+}
+
+function patchAttrs(a, b) {
+  a.getAttributeNames().forEach((n) => { if (!b.hasAttribute(n)) a.removeAttribute(n); });
+  b.getAttributeNames().forEach((n) => {
+    const v = b.getAttribute(n);
+    if (a.getAttribute(n) !== v) a.setAttribute(n, v);
+  });
+}
+
+function syncInput(a, b) {
+  // Never fight the user while they type in a field the browser validates (number / month).
+  if (a === document.activeElement && (a.type === 'number' || a.type === 'month' || a.type === 'date')) return;
+  const v = b.getAttribute('value') || '';
+  if (a.value !== v) a.value = v;
+}
+
+function syncSelect(a, b) {
+  const v = b.getAttribute('data-value');
+  if (v == null) return;
+  const hasOption = Array.prototype.some.call(a.options, (o) => o.value === v);
+  if (hasOption && a.value !== v) a.value = v;
+}
+
+/* ---- event delegation: markup carries data-act / data-chg ---- */
+const H = {}; // handler registry — see section 10
+function bindEvents(root) {
+  const dispatch = (attr) => (e) => {
+    const el = e.target.closest && e.target.closest('[' + attr + ']');
+    if (!el || !root.contains(el)) return;
+    const fn = H[el.getAttribute(attr)];
+    if (fn) fn(el, e);
+  };
+  root.addEventListener('click', dispatch('data-act'));
+  root.addEventListener('input', (e) => { if (/^(INPUT|TEXTAREA|SELECT)$/.test(e.target.nodeName)) dispatch('data-chg')(e); });
+}
+
+let toastTimer = null;
+function flash(msg, ms) {
+  if (toastTimer) clearTimeout(toastTimer);
+  setState({ savedMsg: msg });
+  toastTimer = setTimeout(() => setState({ savedMsg: '' }), ms || TOAST_MS);
+}
+
+function updateScale() {
+  if (!WORKSPACE.fit) { S.scale = 1; return; }
+  S.scale = Math.max(Math.min((window.innerWidth - 16) / WORKSPACE.width, (window.innerHeight - 16) / WORKSPACE.height), 0.2);
+}
+
+
+/* =====================================================================================================
+ * 6. DOMAIN HELPERS
+ * ===================================================================================================== */
+const splitList = (s) => String(s || '').split(',').map((x) => x.trim()).filter(Boolean);
+const fwArr = (tp) => splitList(tp.applicable_frameworks);
+const regArr = (tp) => splitList(tp.regions);
+const myYear = (tp) => (tp.assessment_month_year ? parseInt(tp.assessment_month_year.slice(0, 4), 10) : null);
+const myMonth = (tp) => (tp.assessment_month_year ? parseInt(tp.assessment_month_year.slice(5, 7), 10) - 1 : null);
+function monthLabel(my) {
+  if (!my) return '—';
+  return MONTHS[parseInt(my.slice(5, 7), 10) - 1].slice(0, 3) + ' ' + my.slice(0, 4);
+}
+const sortArrow = (k) => (S.sort.key === k ? (S.sort.dir === 1 ? '↑' : '↓') : '');
+const effectiveRole = () => (S.me && S.me.role === 'Manager' ? S.viewAs : 'Reviewer');
+const viewAllowed = (view) => !(MANAGER_ONLY_VIEWS.indexOf(view) >= 0 && effectiveRole() !== 'Manager');
+const emailRe = /^[^@\s]+@[^@\s]+\.[^@\s]+$/;
+function userParts(u) {
+  const cap = (s) => (s ? s[0].toUpperCase() + s.slice(1) : '');
+  const local = String(u.email || '').split('@')[0];
+  const first = (u.first || '').trim() || cap(local.split('.')[0] || '');
+  const last = (u.last || '').trim() || cap(local.split('.')[1] || '');
+  return { first, last, full: (first + ' ' + last).trim(), initials: ((first[0] || '') + (last[0] || '')).toUpperCase() };
+}
+function newDraft() {
+  return {
+    tp_id: '', name: '', alternate_name: '', assessment_month_year: S.year + '-01', status: 'Planned', lead_reviewer: '',
+    regions: 'NA', tp_locations: '', headcount: '', notes: '', business_owner: '', assessment_type: S.cfg.assessment_type[0] || 'Questionnaire',
+    applicable_frameworks: '', vra_number: '', completed_date: '', region_lead: '', supplier_type: '', infosec_version: '',
+    created_at: '', updated_at: '', lobs: [{ lob_id: '', line_of_business: '', service_description: '', vendor_manager: '' }]
+  };
+}
+
+/** Applies a getInitialData() payload to state (used at boot and on background refresh). */
+function applyAppData(d) {
+  S.me = d.me;
+  S.cfg = Object.assign(clone(DEFAULT_CFG), d.config || {});
+  S.tps = list(d.tps);
+  S.lobs = list(d.lobs);
+  S.users = list(d.users);
+  S.tpsStamp++;
+  S.spreadsheetId = String(d.spreadsheetId || '');
+  S.loadedAt = Date.now();
+  S.viewAs = d.me.role === 'Manager' ? S.viewAs : 'Reviewer';
+  if (!viewAllowed(S.view)) S.view = 'exec';
+}
+
+
+/* =====================================================================================================
+ * 7. DERIVED VALUES — everything the views display is computed here from state.
+ *    (Executive Summary / Analytics / Program View / Roster are driven only by the data layer.)
+ * ===================================================================================================== */
+function renderVals() {
+  const Y = S.year;
+  const role = effectiveRole();
+  const isMgr = role === 'Manager';
+  const statusOrder = S.cfg.status;
+  const regions = S.cfg.region;
+
+  const inYear = S.tps.filter((t) => myYear(t) === Y);
+  const work = inYear.filter((t) => t.status !== 'Not Applicable');           // workload metrics exclude Not Applicable
+  const completed = work.filter((t) => t.status === 'Completed');
+  const naAll = S.tps.filter((t) => t.status === 'Not Applicable');           // universe counts include it
+  const rate = work.length ? Math.round((completed.length / work.length) * 100) : 0;
+  const gaps = S.tps.filter((t) => t.status !== 'Not Applicable' && myYear(t) !== Y);
+
+  // ---- Executive Summary
+  const fwCounts = {};
+  S.tps.forEach((t) => fwArr(t).forEach((f) => { fwCounts[f] = (fwCounts[f] || 0) + 1; }));
+  const fwMax = Math.max(1, ...Object.keys(fwCounts).map((k) => fwCounts[k]));
+  const fwCoverage = Object.keys(fwCounts).sort((a, b) => fwCounts[b] - fwCounts[a])
+    .map((n) => ({ name: n, count: fwCounts[n], w: Math.round((fwCounts[n] / fwMax) * 100) + '%' }));
+
+  const donutLegend = statusOrder
+    .map((st) => ({ label: st, count: S.tps.filter((t) => t.status === st).length, color: statusDot(st) }))
+    .filter((s) => s.count > 0);
+  let acc = 0;
+  const total = Math.max(1, S.tps.length);
+  const stops = donutLegend.map((s) => {
+    const from = (acc / total) * 360; acc += s.count;
+    return s.color + ' ' + from.toFixed(1) + 'deg ' + ((acc / total) * 360).toFixed(1) + 'deg';
+  });
+  const donutBg = stops.length ? 'conic-gradient(' + stops.join(', ') + ')' : 'var(--muted)';
+  const naSorted = naAll.slice().sort((a, b) => (b.assessment_month_year || '').localeCompare(a.assessment_month_year || '')).slice(0, 4);
+
+  // ---- Analytics
+  const rMax = Math.max(1, ...regions.map((r) => work.filter((t) => regArr(t).indexOf(r) >= 0).length));
+  const regionBars = regions.map((r) => {
+    const rows = work.filter((t) => regArr(t).indexOf(r) >= 0);
+    return { region: r, count: rows.length, heads: rows.reduce((s, t) => s + (+t.headcount || 0), 0).toLocaleString(), w: Math.round((rows.length / rMax) * 100) + '%' };
+  });
+  const qData = [0, 1, 2, 3].map((q) => {
+    const rows = work.filter((t) => myMonth(t) !== null && Math.floor(myMonth(t) / 3) === q);
+    const comp = rows.filter((t) => t.status === 'Completed');
+    return { label: 'Q' + (q + 1), s: rows.length, c: comp.length, rate: rows.length ? Math.round((comp.length / rows.length) * 100) + '% done' : '—' };
+  });
+  const qMax = Math.max(1, ...qData.map((q) => q.s));
+  const quarterBars = qData.map((q) => Object.assign(q, { sH: Math.max(3, Math.round((q.s / qMax) * 100)) + '%', cH: Math.max(3, Math.round((q.c / qMax) * 100)) + '%' }));
+  const mData = MONTHS.map((mm, i) => {
+    const rows = work.filter((t) => myMonth(t) === i);
+    return { label: mm[0], s: rows.length, c: rows.filter((t) => t.status === 'Completed').length };
+  });
+  const mMax = Math.max(1, ...mData.map((m) => m.s));
+  const monthBars = mData.map((m) => Object.assign(m, { sH: Math.max(3, Math.round((m.s / mMax) * 100)) + '%', cH: Math.max(3, Math.round((m.c / mMax) * 100)) + '%' }));
+
+  // ---- Program View
+  const monthCells = MONTHS.map((mm, i) => {
+    const rows = inYear.filter((t) => myMonth(t) === i)
+      .sort((a, b) => (a.status === 'Not Applicable') - (b.status === 'Not Applicable') || a.name.localeCompare(b.name));
+    const active = rows.filter((t) => t.status !== 'Not Applicable');                // muted N/A rows do not count
+    return {
+      label: mm, count: active.length,
+      items: rows.map((t) => ({ tp_id: t.tp_id, name: t.name, status: t.status, dot: statusDot(t.status), op: t.status === 'Not Applicable' ? 0.45 : 1 }))
+    };
+  });
+
+  // ---- Roster
+  const F = S.filters;
+  const q = F.q.trim().toLowerCase();
+  const rosterRows = S.tps.filter((t) => {
+    if (q && [t.name, t.alternate_name, t.tp_id, t.vra_number, t.lead_reviewer, t.region_lead, t.business_owner].join(' ').toLowerCase().indexOf(q) < 0) return false;
+    if (F.status !== 'All statuses' && t.status !== F.status) return false;
+    if (F.region !== 'All regions' && regArr(t).indexOf(F.region) < 0) return false;
+    if (F.owner !== 'All owners' && t.business_owner !== F.owner) return false;
+    if (F.fw !== 'All frameworks' && fwArr(t).indexOf(F.fw) < 0) return false;
+    return true;
+  }).sort((a, b) => {
+    const k = S.sort.key;
+    const sv = (t) => k === 'name' ? t.name.toLowerCase()
+      : k === 'month' ? (t.assessment_month_year || '9999')
+      : k === 'status' ? t.status
+      : k === 'vra' ? (t.vra_number || '\uffff')
+      : k === 'completed' ? (t.completed_date || '9999')
+      : k === 'region' ? regArr(t).join(', ')
+      : k === 'regionLead' ? (t.region_lead || '\uffff')
+      : k === 'lead' ? t.lead_reviewer
+      : k === 'owner' ? t.business_owner
+      : k === 'supplier' ? (t.supplier_type || '\uffff')
+      : k === 'type' ? t.assessment_type
+      : k === 'infosec' ? (t.infosec_version || '\uffff')
+      : fwArr(t).join(', ');
+    return (String(sv(a)).localeCompare(String(sv(b))) || a.name.localeCompare(b.name)) * S.sort.dir;
+  }).map((t) => {
+    const fw = fwArr(t);
+    return {
+      tp_id: t.tp_id, name: t.name, monthLabel: monthLabel(t.assessment_month_year), status: t.status, dot: statusDot(t.status),
+      regions: regArr(t), lead: t.lead_reviewer, owner: t.business_owner, type: t.assessment_type,
+      vra: t.vra_number || '—', completed: t.completed_date || '—', regionLead: t.region_lead || '—',
+      supplier: t.supplier_type || '—', infosec: t.infosec_version || '—',
+      fwText: fw.slice(0, 2).join(' · ') + (fw.length > 2 ? ' +' + (fw.length - 2) : ''), op: t.status === 'Not Applicable' ? 0.55 : 1
+    };
+  });
+  const extraFw = Object.keys(fwCounts).filter((f) => S.cfg.framework.indexOf(f) < 0).sort();
+
+  // ---- Record panel
+  const dr = S.draft || {};
+  const drFw = S.draft ? fwArr(dr) : [];
+  const chip = (name, on) => ({ name, on, bg: on ? 'var(--primary)' : 'transparent', fg: on ? 'var(--primary-foreground)' : 'var(--foreground)', bc: on ? 'var(--primary)' : 'var(--border)' });
+  const fwChipNames = S.cfg.framework.concat(drFw.filter((f) => S.cfg.framework.indexOf(f) < 0)); // keep unknown tags removable
+
+  // ---- Users
+  const users = S.users.map((u) => {
+    const n = userParts(u);
+    return { email: u.email, name: n.full, role: u.role, added: u.added, badge: u.role === 'Manager' ? 'default' : 'secondary', initials: n.initials };
+  });
+  const ud = S.userDraft;
+  const me = S.me || { full: '', initials: '' };
+
+  // ---- workspace frame
+  const fit = WORKSPACE.fit;
+  const wsDyn = fit
+    ? 'left:50%;top:50%;width:' + WORKSPACE.width + 'px;height:' + WORKSPACE.height + 'px;transform:translate(-50%,-50%) scale(' + S.scale + ')'
+    : 'left:0;top:0;width:100%;height:100%;transform:none;border:0;border-radius:0;box-shadow:none';
+
+  const navBg = (v) => (S.view === v ? 'var(--sidebar-accent)' : 'transparent');
+  const navFg = (v) => (S.view === v ? 'var(--sidebar-accent-foreground)' : 'var(--muted-foreground)');
+  const yearOptions = [new Date().getFullYear() - 1, new Date().getFullYear(), new Date().getFullYear() + 1];
+  if (yearOptions.indexOf(Y) < 0) yearOptions.push(Y);
+
+  return {
+    // shell
+    themeClass: S.dark ? 'dark' : '',
+    deskBg: S.dark ? 'oklch(0.11 0 0)' : WORKSPACE.deskShade,
+    wsDyn, year: Y, yearOptions, role, isManager: isMgr,
+    sunDisp: S.dark ? 'block' : 'none', moonDisp: S.dark ? 'none' : 'block',
+    themeTitle: S.dark ? 'Switch to light mode' : 'Switch to dark mode',
+    userName: me.full, userInitials: me.initials,
+    roleMgrState: isMgr ? 'active' : 'inactive', roleRevState: isMgr ? 'inactive' : 'active',
+    viewTitle: VIEW_TITLES[S.view][0],
+    viewSub: S.view === 'roster' ? (S.spreadsheetId || '—') : VIEW_TITLES[S.view][1],
+    viewSubIsId: S.view === 'roster',
+    isExec: S.view === 'exec', isAnalytics: S.view === 'analytics', isProgram: S.view === 'program',
+    isRoster: S.view === 'roster', isUsers: S.view === 'users',
+    navExecBg: navBg('exec'), navExecFg: navFg('exec'), navAnalyticsBg: navBg('analytics'), navAnalyticsFg: navFg('analytics'),
+    navProgramBg: navBg('program'), navProgramFg: navFg('program'), navRosterBg: navBg('roster'), navRosterFg: navFg('roster'),
+    navUsersBg: navBg('users'), navUsersFg: navFg('users'),
+
+    // option lists (from the Config sheet)
+    statusOptions: statusOrder, regionOptions: regions, typeOptions: S.cfg.assessment_type, roleOptions: S.cfg.role,
+    supplierOptions: list(S.cfg.supplier_type), infosecOptions: list(S.cfg.infosec_version),
+
+    // executive summary
+    kUniverse: S.tps.length, kScheduled: work.length, kCompleted: completed.length, kRatePct: rate + '%', kNa: naAll.length,
+    fwCoverage, donutBg, donutLegend,
+    gapItems: gaps.map((t) => ({ tp_id: t.tp_id, name: t.name, owner: t.business_owner })), hasGaps: gaps.length > 0, noGaps: gaps.length === 0,
+    naRecent: naSorted.map((t) => ({ tp_id: t.tp_id, name: t.name, note: t.notes, monthLabel: monthLabel(t.assessment_month_year) })),
+
+    // analytics / program
+    regionBars, quarterBars, monthBars, monthCells,
+
+    // roster
+    filters: S.filters, rosterRows,
+    statusLegend: statusOrder.map((st) => ({ label: st, color: statusDot(st) })),
+    arrName: sortArrow('name'), arrMonth: sortArrow('month'), arrStatus: sortArrow('status'), arrRegion: sortArrow('region'),
+    arrLead: sortArrow('lead'), arrOwner: sortArrow('owner'), arrType: sortArrow('type'), arrFw: sortArrow('fw'),
+    arrVra: sortArrow('vra'), arrCompleted: sortArrow('completed'), arrRegionLead: sortArrow('regionLead'),
+    arrSupplier: sortArrow('supplier'), arrInfosec: sortArrow('infosec'),
+    rosterCount: rosterRows.length + ' of ' + S.tps.length + ' third parties',
+    ownerOptions: Array.from(new Set(S.tps.map((t) => t.business_owner).filter(Boolean))).sort(),
+    fwNames: S.cfg.framework.concat(extraFw),
+
+    // users
+    users, newUserEmail: S.newUserEmail, newUserFirst: S.newUserFirst, newUserLast: S.newUserLast, newUserRole: S.newUserRole, userErr: S.userErr,
+    userPanelOpen: S.userPanelOpen, userDraft: ud || {}, userDraftErr: S.userDraftErr, userDraftAdded: (ud || {}).added || '',
+    userDraftInitials: ud ? userParts(ud).initials : '',
+
+    // record panel
+    panelOpen: S.panelOpen, draft: dr, busy: S.busy,
+    panelTitle: dr.name || 'New third party',
+    panelId: dr.tp_id || 'ID assigned on save',
+    panelMeta: dr.created_at ? '· created ' + dr.created_at.slice(0, 10) + ' · updated ' + (dr.updated_at || '').slice(0, 10) : '',
+    draftIsNA: S.panelOpen && dr.status === 'Not Applicable', draftNotNA: S.panelOpen && dr.status !== 'Not Applicable',
+    draftErr: S.draftErr, lobRows: dr.lobs || [],
+    regionChips: regions.map((n) => chip(n, S.draft ? regArr(dr).indexOf(n) >= 0 : false)),
+    regionLeadChips: regions.map((n) => chip(n, !!S.draft && dr.region_lead === n)),
+    fwChips: fwChipNames.map((n) => chip(n, drFw.indexOf(n) >= 0)),
+    canDelete: isMgr && !!dr.tp_id, deleteArmed: S.deleteArmed, deleteNotArmed: !S.deleteArmed,
+    savedMsg: S.savedMsg
+  };
+}
+
+/* =====================================================================================================
+ * 8. PAGE COMPOSITION
+ * ===================================================================================================== */
+function buildApp(v) {
+  return `<div class="${esc(v.themeClass)}" style="position:fixed;inset:0;background:${esc(v.deskBg)};overflow:hidden">
+<div style="position:absolute;${esc(v.wsDyn)};background:var(--background);color:var(--foreground);border:1px solid var(--border);border-radius:18px;box-shadow:var(--shadow-lg);display:flex;overflow:hidden;${WORKSPACE.fit ? '' : 'border:0;border-radius:0;box-shadow:none;'}">
+  ${viewSidebar(v)}
+  <div style="flex:1;min-width:0;display:flex;flex-direction:column">
+    ${viewTopbar(v)}
+    <div id="main-scroll" style="flex:1;min-height:0;overflow-y:auto;padding:16px;background:var(--surface)">
+      ${v.isExec ? viewExec(v) : ''}
+      ${v.isAnalytics ? viewAnalytics(v) : ''}
+      ${v.isProgram ? viewProgram(v) : ''}
+      ${v.isRoster ? viewRoster(v) : ''}
+      ${v.isUsers ? viewUsers(v) : ''}
+    </div>
+  </div>
+  ${v.userPanelOpen ? viewUserPanel(v) : ''}
+  ${v.panelOpen ? viewRecordPanel(v) : ''}
+  ${v.savedMsg ? viewToast(v) : ''}
+</div>
+</div>`;
+}
+
+/** Loading / access-denied / error screens, drawn with the same tokens as the app. */
+function buildBootState() {
+  const icon = (paths) => `<div style="width:44px;height:44px;border-radius:50%;background:var(--muted);display:flex;align-items:center;justify-content:center;color:var(--muted-foreground)"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">${paths}</svg></div>`;
+  let body;
+  if (S.boot === 'loading') {
+    body = `<span style="width:22px;height:22px;border-radius:50%;border:2px solid var(--border);border-top-color:var(--foreground);animation:spin .7s linear infinite;box-sizing:border-box"></span>
+      <span style="font-size:13px;font-weight:600;letter-spacing:var(--tracking-tight)">Loading workspace…</span>
+      <span style="font-size:11.5px;color:var(--muted-foreground)">reading the roster from Google Sheets</span>`;
+  } else if (S.boot === 'denied') {
+    body = `${icon('<rect width="18" height="11" x="3" y="11" rx="2" ry="2"></rect><path d="M7 11V7a5 5 0 0 1 10 0v4"></path>')}
+      <span style="font-size:14px;font-weight:600;letter-spacing:var(--tracking-tight)">You don’t have access yet</span>
+      <span style="font-size:11.5px;color:var(--muted-foreground);line-height:1.5">This tool is limited to approved users. Ask a Manager to add your Google account email under User Management, then reload this page.</span>`;
+  } else {
+    body = `${icon('<circle cx="12" cy="12" r="10"></circle><path d="M12 8v4"></path><path d="M12 16h.01"></path>')}
+      <span style="font-size:14px;font-weight:600;letter-spacing:var(--tracking-tight)">Couldn’t load the workspace</span>
+      <span style="font-size:11.5px;color:var(--muted-foreground);line-height:1.5;word-break:break-word">${esc(S.bootError)}</span>
+      <button class="ui-btn" data-variant="outline" data-size="sm" data-act="retryBoot">Try again</button>`;
+  }
+  return `<div class="${S.dark ? 'dark' : ''}" style="position:fixed;inset:0;background:${S.dark ? 'oklch(0.11 0 0)' : WORKSPACE.deskShade};display:flex;align-items:center;justify-content:center;color:var(--foreground)">
+    <div class="ui-card boot-card" style="gap:10px">${body}</div></div>`;
+}
+
+
+/** Left navigation rail: brand, modules, admin console, universe meter, signed-in user */
+function viewSidebar(v) {
+  const { isManager, kCompleted, kRatePct, kScheduled, kUniverse, navAnalyticsBg, navAnalyticsFg, navExecBg, navExecFg, navProgramBg, navProgramFg, navRosterBg, navRosterFg, navUsersBg, navUsersFg, role, userInitials, userName, year } = v;
+  return `<div style="width:198px;flex-shrink:0;display:flex;flex-direction:column;background:var(--sidebar);border-right:1px solid var(--sidebar-border)">
+  <div style="display:flex;align-items:center;gap:9px;padding:16px 16px 14px">
+    <div style="width:28px;height:28px;border-radius:8px;background:var(--primary);color:var(--primary-foreground);display:flex;align-items:center;justify-content:center;flex-shrink:0">
+      <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 13c0 5-3.5 7.5-7.66 8.95a1 1 0 0 1-.67-.01C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.24-2.72a1 1 0 0 1 1.52 0C14.5 3.8 17 5 19 5a1 1 0 0 1 1 1z"></path><path d="m9 12 2 2 4-4"></path></svg>
+    </div>
+    <div style="display:flex;flex-direction:column;justify-content:space-between;height:28px">
+      <span style="font-family:var(--font-mono);font-size:12px;font-weight:600;letter-spacing:-0.02em;line-height:11px">tprm/planner</span>
+      <span style="font-size:9px;color:var(--muted-foreground);line-height:8px">assessment planning</span>
+      <span style="font-size:8px;color:var(--muted-foreground);font-family:var(--font-mono);font-weight:700;line-height:8px">v0.26.8</span>
+    </div>
+  </div>
+  <div style="display:flex;flex-direction:column;gap:2px;padding:6px 10px">
+    <span style="font-size:10px;font-weight:500;color:var(--muted-foreground);padding:2px 8px 6px;text-transform:lowercase">modules</span>
+    <div data-view="exec" data-act="setView" style="display:flex;align-items:center;gap:9px;padding:7px 10px;border-radius:var(--radius-md);cursor:pointer;font-size:13px;font-weight:500;transition:background .15s;background:${esc(navExecBg)};color:${esc(navExecFg)}" class="hov-sb">
+      <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="pointer-events:none"><path d="m12 14 4-4"></path><path d="M3.34 19a10 10 0 1 1 17.32 0"></path></svg>Executive Summary
+    </div>
+    <div data-view="analytics" data-act="setView" style="display:flex;align-items:center;gap:9px;padding:7px 10px;border-radius:var(--radius-md);cursor:pointer;font-size:13px;font-weight:500;transition:background .15s;background:${esc(navAnalyticsBg)};color:${esc(navAnalyticsFg)}" class="hov-sb">
+      <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="pointer-events:none"><path d="M3 3v16a2 2 0 0 0 2 2h16"></path><path d="M13 17V9"></path><path d="M18 17V5"></path><path d="M8 17v-3"></path></svg>Analytics
+    </div>
+    <div data-view="program" data-act="setView" style="display:flex;align-items:center;gap:9px;padding:7px 10px;border-radius:var(--radius-md);cursor:pointer;font-size:13px;font-weight:500;transition:background .15s;background:${esc(navProgramBg)};color:${esc(navProgramFg)}" class="hov-sb">
+      <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="pointer-events:none"><path d="M8 2v4"></path><path d="M16 2v4"></path><rect width="18" height="18" x="3" y="4" rx="2"></rect><path d="M3 10h18"></path></svg>Program View
+    </div>
+    <div data-view="roster" data-act="setView" style="display:flex;align-items:center;gap:9px;padding:7px 10px;border-radius:var(--radius-md);cursor:pointer;font-size:13px;font-weight:500;transition:background .15s;background:${esc(navRosterBg)};color:${esc(navRosterFg)}" class="hov-sb">
+      <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="pointer-events:none"><path d="M8 6h13"></path><path d="M8 12h13"></path><path d="M8 18h13"></path><path d="M3 6h.01"></path><path d="M3 12h.01"></path><path d="M3 18h.01"></path></svg>Roster
+    </div>
+  </div>
+  ${isManager ? `
+  <div style="display:flex;flex-direction:column;gap:2px;padding:6px 10px">
+    <div style="display:flex;align-items:center;gap:8px;padding:2px 8px 6px">
+      <span style="display:inline-flex;align-items:center;gap:4px;font-size:10px;font-weight:700;color:var(--sidebar-foreground);white-space:nowrap">Admin Console
+        <svg width="9" height="9" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><rect width="18" height="11" x="3" y="11" rx="2" ry="2"></rect><path d="M7 11V7a5 5 0 0 1 10 0v4"></path></svg>
+      </span>
+      <span style="flex:1;height:1px;background:var(--sidebar-border)"></span>
+      <span style="font-size:8.5px;font-weight:600;font-family:var(--font-mono);color:var(--muted-foreground);border:1px solid var(--sidebar-border);border-radius:var(--radius-full);padding:1px 6px;line-height:1.3">manager</span>
+    </div>
+    <div data-view="users" data-act="setView" style="display:flex;align-items:center;gap:9px;padding:7px 10px;border-radius:var(--radius-md);cursor:pointer;font-size:13px;font-weight:500;transition:background .15s;background:${esc(navUsersBg)};color:${esc(navUsersFg)}" class="hov-sb">
+      <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="pointer-events:none"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"></path><circle cx="9" cy="7" r="4"></circle><path d="M22 21v-2a4 4 0 0 0-3-3.87"></path><path d="M16 3.13a4 4 0 0 1 0 7.75"></path></svg>User Management
+    </div>
+  </div>
+  ` : ''}
+  <div style="flex:1"></div>
+  <div style="margin:10px;padding:10px;border:1px solid var(--sidebar-border);border-radius:var(--radius-lg);background:var(--background);display:flex;flex-direction:column;gap:6px">
+    <div style="display:flex;justify-content:space-between;align-items:center">
+      <span style="font-size:11px;font-weight:500;color:var(--muted-foreground)">Universe</span>
+      <span class="ui-badge" data-variant="secondary">${esc(kUniverse)}</span>
+    </div>
+    <div class="ui-progress" style="height:6px"><div class="ui-progress-indicator" style="width:${esc(kRatePct)}"></div></div>
+    <span style="font-size:10.5px;color:var(--muted-foreground)">${esc(kCompleted)} of ${esc(kScheduled)} assessments completed · ${esc(year)}</span>
+  </div>
+  <div style="display:flex;align-items:center;gap:9px;padding:12px 16px;border-top:1px solid var(--sidebar-border)">
+    <span class="ui-avatar" style="background:var(--muted);font-size:11px;font-weight:600">${esc(userInitials)}</span>
+    <div style="display:flex;flex-direction:column;gap:1px;min-width:0">
+      <span style="font-size:12px;font-weight:500;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${esc(userName)}</span>
+      <span style="font-size:10.5px;color:var(--muted-foreground)">${esc(role)}</span>
+    </div>
+  </div>
+</div>`;
+}
+
+/** Top bar: view title, year select, theme toggle, role segmented control */
+function viewTopbar(v) {
+  const { moonDisp, roleMgrState, roleRevState, sunDisp, themeTitle, viewSub, viewSubIsId, viewTitle, year, yearOptions } = v;
+  return `<div style="height:56px;flex-shrink:0;display:flex;align-items:center;gap:12px;padding:0 16px;border-bottom:1px solid var(--border)">
+  <div style="display:flex;flex-direction:column;gap:1px;min-width:0">
+    <span style="font-size:14px;font-weight:600;letter-spacing:var(--tracking-tight)">${esc(viewTitle)}</span>
+    <span ${viewSubIsId ? 'title="Database spreadsheet ID (Script Properties → SPREADSHEET_ID)"' : ''} style="font-size:11px;color:var(--muted-foreground);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;${viewSubIsId ? 'font-family:var(--font-mono);user-select:all' : ''}">${esc(viewSub)}</span>
+  </div>
+  <div style="flex:1"></div>
+  <select class="ui-select" data-value="${esc(year)}" data-chg="setYear" style="min-width:5.5rem;height:2rem;font-size:13px">
+    ${list(yearOptions).map((o) => `<option value="${esc(o)}">${esc(o)}</option>`).join('')}
+  </select>
+  <button class="ui-btn" data-variant="ghost" data-size="icon-sm" data-act="toggleDark" title="${esc(themeTitle)}" style="color:var(--foreground)">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="pointer-events:none;display:${esc(sunDisp)}"><circle cx="12" cy="12" r="4"></circle><path d="M12 2v2"></path><path d="M12 20v2"></path><path d="m4.93 4.93 1.41 1.41"></path><path d="m17.66 17.66 1.41 1.41"></path><path d="M2 12h2"></path><path d="M20 12h2"></path><path d="m6.34 17.66-1.41 1.41"></path><path d="m19.07 4.93-1.41 1.41"></path></svg>
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="pointer-events:none;display:${esc(moonDisp)}"><path d="M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9Z"></path></svg>
+  </button>
+  <div class="ui-tabs-list" style="height:2rem">
+    <button class="ui-tabs-trigger" data-state="${esc(roleMgrState)}" data-role="Manager" data-act="setRole" style="font-size:12px;padding:4px 10px">Manager</button>
+    <button class="ui-tabs-trigger" data-state="${esc(roleRevState)}" data-role="Reviewer" data-act="setRole" style="font-size:12px;padding:4px 10px">Reviewer</button>
+  </div>
+</div>`;
+}
+
+/** Executive Summary — KPI cards, framework coverage, status mix, gaps, hygiene */
+function viewExec(v) {
+  const { donutBg, donutLegend, fwCoverage, gapItems, hasGaps, kCompleted, kNa, kRatePct, kScheduled, kUniverse, naRecent, noGaps, year } = v;
+  return `<div style="display:flex;flex-direction:column;gap:12px;min-height:100%">
+  <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:12px">
+    <div class="ui-card" style="gap:6px;padding:14px 0">
+      <div class="ui-card-content" style="padding:0 16px;display:flex;flex-direction:column;gap:5px">
+        <span style="font-size:11.5px;font-weight:500;color:var(--muted-foreground)">Third party universe</span>
+        <span style="font-size:26px;font-weight:600;letter-spacing:var(--tracking-tight);line-height:1">${esc(kUniverse)}</span>
+        <span style="font-size:11px;color:var(--muted-foreground)">permanent records, all statuses</span>
+      </div>
+    </div>
+    <div class="ui-card" style="gap:6px;padding:14px 0">
+      <div class="ui-card-content" style="padding:0 16px;display:flex;flex-direction:column;gap:5px">
+        <span style="font-size:11.5px;font-weight:500;color:var(--muted-foreground)">Scheduled · ${esc(year)}</span>
+        <span style="font-size:26px;font-weight:600;letter-spacing:var(--tracking-tight);line-height:1">${esc(kScheduled)}</span>
+        <span style="font-size:11px;color:var(--muted-foreground)">assessments on the calendar</span>
+      </div>
+    </div>
+    <div class="ui-card" style="gap:6px;padding:14px 0">
+      <div class="ui-card-content" style="padding:0 16px;display:flex;flex-direction:column;gap:5px">
+        <span style="font-size:11.5px;font-weight:500;color:var(--muted-foreground)">Completed · ${esc(year)}</span>
+        <div style="display:flex;align-items:baseline;gap:6px"><span style="font-size:26px;font-weight:600;letter-spacing:var(--tracking-tight);line-height:1">${esc(kCompleted)}</span><span style="font-size:12px;color:var(--muted-foreground)">${esc(kRatePct)}</span></div>
+        <div class="ui-progress" style="height:5px;margin-top:3px"><div class="ui-progress-indicator" style="width:${esc(kRatePct)}"></div></div>
+      </div>
+    </div>
+    <div class="ui-card" style="gap:6px;padding:14px 0">
+      <div class="ui-card-content" style="padding:0 16px;display:flex;flex-direction:column;gap:5px">
+        <span style="font-size:11.5px;font-weight:500;color:var(--muted-foreground)">Not Applicable</span>
+        <span style="font-size:26px;font-weight:600;letter-spacing:var(--tracking-tight);line-height:1;color:var(--muted-foreground)">${esc(kNa)}</span>
+        <span style="font-size:11px;color:var(--muted-foreground)">no active relationship found</span>
+      </div>
+    </div>
+  </div>
+
+  <div style="display:grid;grid-template-columns:3fr 2fr;gap:12px">
+    <div class="ui-card" style="gap:12px;padding:16px 0">
+      <div class="ui-card-header" style="padding:0 16px"><span class="ui-card-title" style="font-size:13.5px">Framework coverage</span><span class="ui-card-description" style="font-size:11.5px">vendors tagged per regulatory framework</span></div>
+      <div class="ui-card-content" style="padding:0 16px;display:flex;flex-direction:column;gap:7px">
+        ${list(fwCoverage).map((f, $index) => `
+          <div style="display:flex;align-items:center;gap:10px">
+            <span style="font-family:var(--font-mono);font-size:11px;width:84px;flex-shrink:0;color:var(--foreground)">${esc(f.name)}</span>
+            <div style="flex:1;height:8px;border-radius:2px;background:var(--muted);overflow:hidden"><div style="height:100%;background:var(--chart-2);width:${esc(f.w)}"></div></div>
+            <span style="font-size:11px;color:var(--muted-foreground);width:20px;text-align:right">${esc(f.count)}</span>
+          </div>
+        `).join('')}
+      </div>
+    </div>
+    <div class="ui-card" style="gap:12px;padding:16px 0">
+      <div class="ui-card-header" style="padding:0 16px"><span class="ui-card-title" style="font-size:13.5px">Status mix</span><span class="ui-card-description" style="font-size:11.5px">whole universe · Not Applicable shown separately</span></div>
+      <div class="ui-card-content" style="padding:0 16px;display:flex;align-items:center;justify-content:space-evenly;gap:16px;flex:1">
+        <div style="position:relative;width:172px;height:172px;flex-shrink:0">
+          <div style="width:172px;height:172px;border-radius:50%;background:${esc(donutBg)}"></div>
+          <div style="position:absolute;inset:30px;border-radius:50%;background:var(--card);display:flex;flex-direction:column;align-items:center;justify-content:center;gap:1px">
+            <span style="font-size:26px;font-weight:600;letter-spacing:var(--tracking-tight)">${esc(kUniverse)}</span>
+            <span style="font-size:10.5px;color:var(--muted-foreground)">records</span>
+          </div>
+        </div>
+        <div style="display:flex;flex-direction:column;gap:9px;min-width:0">
+          ${list(donutLegend).map((s, $index) => `
+            <div style="display:flex;align-items:center;gap:8px;font-size:12px">
+              <span style="width:9px;height:9px;border-radius:2px;flex-shrink:0;background:${esc(s.color)}"></span>
+              <span style="color:var(--foreground);white-space:nowrap">${esc(s.label)}</span>
+              <span style="color:var(--muted-foreground)">${esc(s.count)}</span>
+            </div>
+          `).join('')}
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;flex:1">
+    <div class="ui-card" style="gap:10px;padding:16px 0">
+      <div class="ui-card-header" style="padding:0 16px"><span class="ui-card-title" style="font-size:13.5px">Coverage gaps</span><span class="ui-card-description" style="font-size:11.5px">active third parties with no ${esc(year)} assessment date</span></div>
+      <div class="ui-card-content" style="padding:0 16px;display:flex;flex-wrap:wrap;gap:6px">
+        ${hasGaps ? `
+        ${list(gapItems).map((g, $index) => `
+          <div data-id="${esc(g.tp_id)}" data-act="openTp" style="display:flex;align-items:center;gap:7px;padding:6px 10px;border:1px solid var(--border);border-radius:var(--radius-md);cursor:pointer;background:var(--background);transition:background .15s" class="hov-acc">
+            <span style="width:7px;height:7px;border-radius:50%;background:var(--destructive);flex-shrink:0;pointer-events:none"></span>
+            <div style="display:flex;flex-direction:column;pointer-events:none"><span style="font-size:12px;font-weight:500">${esc(g.name)}</span><span style="font-size:10px;color:var(--muted-foreground)">${esc(g.owner)}</span></div>
+          </div>
+        `).join('')}
+        ` : ''}
+        ${noGaps ? `<span style="font-size:12px;color:var(--muted-foreground)">None — every active record has a ${esc(year)} date.</span>` : ''}
+      </div>
+    </div>
+    <div class="ui-card" style="gap:10px;padding:16px 0">
+      <div class="ui-card-header" style="padding:0 16px"><span class="ui-card-title" style="font-size:13.5px">Universe hygiene</span><span class="ui-card-description" style="font-size:11.5px">latest discovery flags — retained as permanent records</span></div>
+      <div class="ui-card-content" style="padding:0 16px;display:flex;flex-direction:column;gap:7px">
+        ${list(naRecent).map((n, $index) => `
+          <div data-id="${esc(n.tp_id)}" data-act="openTp" style="display:flex;gap:9px;align-items:flex-start;cursor:pointer;padding:5px 8px;margin:0 -8px;border-radius:var(--radius-md);transition:background .15s" class="hov-acc">
+            <span class="ui-badge" data-variant="outline" style="flex-shrink:0;pointer-events:none;color:var(--muted-foreground)">${esc(n.monthLabel)}</span>
+            <div style="display:flex;flex-direction:column;gap:1px;min-width:0;pointer-events:none">
+              <span style="font-size:12px;font-weight:500">${esc(n.name)}</span>
+              <span style="font-size:11px;color:var(--muted-foreground);display:-webkit-box;-webkit-line-clamp:1;-webkit-box-orient:vertical;overflow:hidden">${esc(n.note)}</span>
+            </div>
+          </div>
+        `).join('')}
+      </div>
+    </div>
+  </div>
+</div>`;
+}
+
+/** Analytics — by region / quarter / month / status */
+function viewAnalytics(v) {
+  const { donutBg, donutLegend, kUniverse, monthBars, quarterBars, regionBars, year } = v;
+  return `<div style="display:grid;grid-template-columns:1fr 1fr;grid-template-rows:1fr 1fr;gap:12px;height:100%;min-height:660px">
+  <div class="ui-card" style="gap:10px;padding:16px 0">
+    <div class="ui-card-header" style="padding:0 16px"><span class="ui-card-title" style="font-size:13.5px">By region</span><span class="ui-card-description" style="font-size:11.5px">${esc(year)} workload · excludes Not Applicable</span></div>
+    <div class="ui-card-content" style="padding:0 16px;display:flex;flex-direction:column;gap:14px;justify-content:center;flex:1">
+      ${list(regionBars).map((r, $index) => `
+        <div style="display:flex;align-items:center;gap:10px">
+          <span style="font-family:var(--font-mono);font-size:11px;width:52px;flex-shrink:0">${esc(r.region)}</span>
+          <div style="flex:1;height:14px;border-radius:var(--radius-sm);background:var(--muted);overflow:hidden"><div style="height:100%;background:var(--chart-3);width:${esc(r.w)}"></div></div>
+          <span style="font-size:11.5px;color:var(--muted-foreground);width:56px;text-align:right">${esc(r.count)} · ${esc(r.heads)}</span>
+        </div>
+      `).join('')}
+      <span style="font-size:10.5px;color:var(--muted-foreground)">count · combined vendor headcount</span>
+    </div>
+  </div>
+  <div class="ui-card" style="gap:10px;padding:16px 0">
+    <div class="ui-card-header" style="padding:0 16px"><span class="ui-card-title" style="font-size:13.5px">By quarter</span><span class="ui-card-description" style="font-size:11.5px">volume and completion rate · ${esc(year)}</span></div>
+    <div class="ui-card-content" style="padding:0 16px;display:flex;align-items:flex-end;gap:18px;flex:1">
+      ${list(quarterBars).map((q, $index) => `
+        <div style="flex:1;display:flex;flex-direction:column;align-items:center;gap:6px;height:100%;justify-content:flex-end">
+          <div style="display:flex;align-items:flex-end;gap:5px;height:130px">
+            <div title="scheduled" style="width:22px;border-radius:4px 4px 0 0;background:var(--chart-1);height:${esc(q.sH)}"></div>
+            <div title="completed" style="width:22px;border-radius:4px 4px 0 0;background:var(--chart-4);height:${esc(q.cH)}"></div>
+          </div>
+          <span style="font-size:11.5px;font-weight:500">${esc(q.label)}</span>
+          <span style="font-size:10.5px;color:var(--muted-foreground)">${esc(q.rate)}</span>
+        </div>
+      `).join('')}
+    </div>
+    <div class="ui-card-footer" style="padding:0 16px;gap:12px">
+      <span style="display:flex;align-items:center;gap:5px;font-size:10.5px;color:var(--muted-foreground)"><span style="width:8px;height:8px;border-radius:2px;background:var(--chart-1)"></span>scheduled</span>
+      <span style="display:flex;align-items:center;gap:5px;font-size:10.5px;color:var(--muted-foreground)"><span style="width:8px;height:8px;border-radius:2px;background:var(--chart-4)"></span>completed</span>
+    </div>
+  </div>
+  <div class="ui-card" style="gap:10px;padding:16px 0">
+    <div class="ui-card-header" style="padding:0 16px"><span class="ui-card-title" style="font-size:13.5px">By month</span><span class="ui-card-description" style="font-size:11.5px">scheduled vs completed · ${esc(year)}</span></div>
+    <div class="ui-card-content" style="padding:0 16px;display:flex;align-items:flex-end;gap:8px;flex:1">
+      ${list(monthBars).map((m, $index) => `
+        <div style="flex:1;display:flex;flex-direction:column;align-items:center;gap:5px;height:100%;justify-content:flex-end">
+          <div style="display:flex;align-items:flex-end;gap:2px;height:120px">
+            <div style="width:9px;border-radius:3px 3px 0 0;background:var(--chart-1);height:${esc(m.sH)}"></div>
+            <div style="width:9px;border-radius:3px 3px 0 0;background:var(--chart-4);height:${esc(m.cH)}"></div>
+          </div>
+          <span style="font-family:var(--font-mono);font-size:9.5px;color:var(--muted-foreground)">${esc(m.label)}</span>
+        </div>
+      `).join('')}
+    </div>
+  </div>
+  <div class="ui-card" style="gap:10px;padding:16px 0">
+    <div class="ui-card-header" style="padding:0 16px"><span class="ui-card-title" style="font-size:13.5px">By status</span><span class="ui-card-description" style="font-size:11.5px">Not Applicable is its own segment — never folded in</span></div>
+    <div class="ui-card-content" style="padding:0 16px;display:flex;align-items:center;gap:18px;flex:1">
+      <div style="position:relative;width:130px;height:130px;flex-shrink:0">
+        <div style="width:130px;height:130px;border-radius:50%;background:${esc(donutBg)}"></div>
+        <div style="position:absolute;inset:24px;border-radius:50%;background:var(--card);display:flex;flex-direction:column;align-items:center;justify-content:center"><span style="font-size:21px;font-weight:600">${esc(kUniverse)}</span><span style="font-size:9.5px;color:var(--muted-foreground)">records</span></div>
+      </div>
+      <div style="display:flex;flex-direction:column;gap:6px">
+        ${list(donutLegend).map((s, $index) => `
+          <div style="display:flex;align-items:center;gap:7px;font-size:12px">
+            <span style="width:8px;height:8px;border-radius:2px;flex-shrink:0;background:${esc(s.color)}"></span>
+            <span style="white-space:nowrap">${esc(s.label)}</span><span style="color:var(--muted-foreground)">${esc(s.count)}</span>
+          </div>
+        `).join('')}
+      </div>
+    </div>
+  </div>
+</div>`;
+}
+
+/** Program View — 12-month planning grid */
+function viewProgram(v) {
+  const { monthCells, year } = v;
+  return `<div style="display:flex;flex-direction:column;gap:10px;height:100%">
+  <div style="display:flex;align-items:center;gap:10px">
+    <span style="font-size:12px;color:var(--muted-foreground)">Assessments by month · ${esc(year)} — Not Applicable records are muted and excluded from totals</span>
+    <div style="flex:1"></div>
+    <button class="ui-btn" data-variant="outline" data-size="sm" data-act="newTp"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M5 12h14"></path><path d="M12 5v14"></path></svg>Add third party</button>
+  </div>
+  <div style="flex:1;min-height:0;display:grid;grid-template-columns:repeat(4,1fr);grid-template-rows:repeat(3,1fr);gap:10px">
+    ${list(monthCells).map((mc, $index) => `
+      <div style="min-height:0;display:flex;flex-direction:column;border:1px solid var(--border);border-radius:var(--radius-lg);background:var(--card);box-shadow:var(--shadow-xs);overflow:hidden">
+        <div style="display:flex;align-items:center;gap:6px;padding:8px 10px;border-bottom:1px solid var(--border);flex-shrink:0">
+          <span style="font-size:12px;font-weight:600">${esc(mc.label)}</span>
+          <div style="flex:1"></div>
+          <span class="ui-badge" data-variant="secondary" style="font-size:10px;padding:1px 6px">${esc(mc.count)}</span>
+        </div>
+        <div style="flex:1;min-height:0;overflow-y:auto;padding:6px;display:flex;flex-direction:column;gap:4px">
+          ${list(mc.items).map((t, $index) => `
+            <div title="${esc(t.status)}" style="display:flex;align-items:center;gap:6px;padding:4px 7px;border-radius:var(--radius-md);cursor:default;background:color-mix(in oklab, var(--muted) 55%, transparent);opacity:${esc(t.op)}">
+              <span style="width:7px;height:7px;border-radius:50%;flex-shrink:0;pointer-events:none;background:${esc(t.dot)}"></span>
+              <span style="font-size:11.5px;font-weight:500;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;pointer-events:none">${esc(t.name)}</span>
+            </div>
+          `).join('')}
+        </div>
+      </div>
+    `).join('')}
+  </div>
+</div>`;
+}
+
+/** Roster */
+function viewRoster(v) {
+  const { regionOptions, statusOptions, arrCompleted, arrFw, arrInfosec, arrLead, arrMonth, arrName, arrOwner, arrRegion, arrRegionLead, arrStatus, arrSupplier, arrType, arrVra, filters, fwNames, ownerOptions, rosterCount, rosterRows, statusLegend } = v;
+  return `<div style="display:flex;flex-direction:column;gap:10px;height:100%">
+  <div style="display:flex;align-items:center;gap:8px">
+    <div style="position:relative">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" style="position:absolute;left:9px;top:50%;transform:translateY(-50%);color:var(--muted-foreground)"><circle cx="11" cy="11" r="8"></circle><path d="m21 21-4.3-4.3"></path></svg>
+      <input class="ui-input" data-key="q" value="${esc(filters.q)}" data-chg="onFilter" placeholder="Search vendor, lead, owner…" style="width:210px;height:2rem;padding-left:28px;font-size:12.5px">
+    </div>
+    <select class="ui-select" data-key="status" data-value="${esc(filters.status)}" data-chg="onFilter" style="height:2rem;min-width:0;font-size:12px">
+      <option>All statuses</option>${list(statusOptions).map((o) => `<option value="${esc(o)}">${esc(o)}</option>`).join('')}
+    </select>
+    <select class="ui-select" data-key="region" data-value="${esc(filters.region)}" data-chg="onFilter" style="height:2rem;min-width:0;font-size:12px">
+      <option>All regions</option>${list(regionOptions).map((o) => `<option value="${esc(o)}">${esc(o)}</option>`).join('')}
+    </select>
+    <select class="ui-select" data-key="owner" data-value="${esc(filters.owner)}" data-chg="onFilter" style="height:2rem;min-width:0;font-size:12px">
+      <option>All owners</option>
+      ${list(ownerOptions).map((o, $index) => `<option value="${esc(o)}">${esc(o)}</option>`).join('')}
+    </select>
+    <select class="ui-select" data-key="fw" data-value="${esc(filters.fw)}" data-chg="onFilter" style="height:2rem;min-width:0;font-size:12px">
+      <option>All frameworks</option>
+      ${list(fwNames).map((fn, $index) => `<option value="${esc(fn)}">${esc(fn)}</option>`).join('')}
+    </select>
+    <button class="ui-btn" data-variant="ghost" data-size="sm" data-act="clearFilters" style="font-size:12px">Clear</button>
+    <div style="flex:1"></div>
+    <span style="font-size:11.5px;color:var(--muted-foreground)">${esc(rosterCount)}</span>
+    <button class="ui-btn" data-variant="default" data-size="sm" data-act="newTp"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M5 12h14"></path><path d="M12 5v14"></path></svg>Add</button>
+  </div>
+  <div style="display:flex;align-items:center;gap:14px;padding:2px 2px 0">
+    <span style="font-size:10.5px;font-weight:600;color:var(--muted-foreground);text-transform:uppercase;letter-spacing:.04em">Status</span>
+    ${list(statusLegend).map((sl, $index) => `
+      <span style="display:inline-flex;align-items:center;gap:5px;font-size:11px;color:var(--muted-foreground)"><span style="width:7px;height:7px;border-radius:50%;flex-shrink:0;background:${esc(sl.color)}"></span>${esc(sl.label)}</span>
+    `).join('')}
+  </div>
+  <div class="ui-card" style="padding:0;gap:0;flex:1;min-height:0;overflow:hidden">
+    <div class="ui-table-wrap" style="overflow-y:auto;height:100%">
+      <table class="ui-table">
+        <thead style="position:sticky;top:0;background:var(--card);z-index:1"><tr>
+          <th data-key="name" data-act="sortBy" style="padding-left:14px;cursor:pointer;user-select:none;white-space:nowrap">Third party ${esc(arrName)}</th>
+          <th data-key="vra" data-act="sortBy" style="cursor:pointer;user-select:none;white-space:nowrap">VRA number ${esc(arrVra)}</th>
+          <th data-key="month" data-act="sortBy" style="cursor:pointer;user-select:none;white-space:nowrap">Month ${esc(arrMonth)}</th>
+          <th data-key="status" data-act="sortBy" style="cursor:pointer;user-select:none;white-space:nowrap">Status ${esc(arrStatus)}</th>
+          <th data-key="completed" data-act="sortBy" style="cursor:pointer;user-select:none;white-space:nowrap">Completed date ${esc(arrCompleted)}</th>
+          <th data-key="region" data-act="sortBy" style="cursor:pointer;user-select:none;white-space:nowrap">Regions ${esc(arrRegion)}</th>
+          <th data-key="regionLead" data-act="sortBy" style="cursor:pointer;user-select:none;white-space:nowrap">Region lead ${esc(arrRegionLead)}</th>
+          <th data-key="lead" data-act="sortBy" style="cursor:pointer;user-select:none;white-space:nowrap">Lead reviewer ${esc(arrLead)}</th>
+          <th data-key="owner" data-act="sortBy" style="cursor:pointer;user-select:none;white-space:nowrap">Business owner ${esc(arrOwner)}</th>
+          <th data-key="supplier" data-act="sortBy" style="cursor:pointer;user-select:none;white-space:nowrap">Supplier type ${esc(arrSupplier)}</th>
+          <th data-key="type" data-act="sortBy" style="cursor:pointer;user-select:none;white-space:nowrap">Type ${esc(arrType)}</th>
+          <th data-key="infosec" data-act="sortBy" style="cursor:pointer;user-select:none;white-space:nowrap">InfoSec version ${esc(arrInfosec)}</th>
+          <th data-key="fw" data-act="sortBy" style="padding-right:14px;cursor:pointer;user-select:none;white-space:nowrap">Frameworks ${esc(arrFw)}</th>
+        </tr></thead>
+        <tbody>
+          ${list(rosterRows).map((r, $index) => `
+            <tr data-id="${esc(r.tp_id)}" data-act="openTp" style="cursor:pointer;opacity:${esc(r.op)}">
+              <td style="padding-left:14px;max-width:210px">
+                <div style="display:flex;flex-direction:column;gap:1px;min-width:0">
+                  <span style="font-weight:500;font-size:12.5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${esc(r.name)}</span>
+                  <span style="font-family:var(--font-mono);font-size:10px;color:var(--muted-foreground)">${esc(r.tp_id)}</span>
+                </div>
+              </td>
+              <td style="font-size:12px;font-family:var(--font-mono)">${esc(r.vra)}</td>
+              <td style="font-size:12px">${esc(r.monthLabel)}</td>
+              <td>
+                <span style="display:inline-flex;align-items:center;gap:6px;font-size:12px"><span style="width:7px;height:7px;border-radius:50%;background:${esc(r.dot)}"></span>${esc(r.status)}</span>
+              </td>
+              <td style="font-size:12px">${esc(r.completed)}</td>
+              <td><div style="display:flex;flex-wrap:wrap;gap:3px">${list(r.regions).map((rg, $index) => `<span class="ui-badge" data-variant="outline" style="font-size:10px">${esc(rg)}</span>`).join('')}</div></td>
+              <td style="font-size:12px">${esc(r.regionLead)}</td>
+              <td style="font-size:12px">${esc(r.lead)}</td>
+              <td style="font-size:12px">${esc(r.owner)}</td>
+              <td style="font-size:12px">${esc(r.supplier)}</td>
+              <td style="font-size:12px;color:var(--muted-foreground)">${esc(r.type)}</td>
+              <td style="font-size:12px">${esc(r.infosec)}</td>
+              <td style="padding-right:14px;font-size:11px;color:var(--muted-foreground);max-width:150px;overflow:hidden;text-overflow:ellipsis">${esc(r.fwText)}</td>
+            </tr>
+          `).join('')}
+        </tbody>
+      </table>
+    </div>
+  </div>
+</div>`;
+}
+
+/** User Management (Manager only) */
+function viewUsers(v) {
+  const { busy, roleOptions, newUserEmail, newUserFirst, newUserLast, newUserRole, userErr, users } = v;
+  return `<div style="display:flex;flex-direction:column;gap:12px">
+  <div class="ui-card" style="gap:12px;padding:16px 0">
+    <div class="ui-card-header" style="padding:0 16px"><span class="ui-card-title" style="font-size:13.5px">Add user</span><span class="ui-card-description" style="font-size:11.5px">managers can access all modules; reviewers get program, roster and record editing</span></div>
+    <div class="ui-card-content" style="padding:0 16px;display:flex;gap:8px">
+      <input class="ui-input" data-key="first" value="${esc(newUserFirst)}" data-chg="onNewUser" placeholder="First name" style="flex:1;min-width:0;height:2.1rem;font-size:12.5px">
+      <input class="ui-input" data-key="last" value="${esc(newUserLast)}" data-chg="onNewUser" placeholder="Last name" style="flex:1;min-width:0;height:2.1rem;font-size:12.5px">
+      <input class="ui-input" data-key="email" value="${esc(newUserEmail)}" data-chg="onNewUser" placeholder="name@company.com" style="flex:1.4;min-width:0;height:2.1rem;font-size:12.5px">
+      <select class="ui-select" data-key="role" data-value="${esc(newUserRole)}" data-chg="onNewUser" style="height:2.1rem;font-size:12px">${list(roleOptions).map((o) => `<option value="${esc(o)}">${esc(o)}</option>`).join('')}</select>
+      <button class="ui-btn" data-variant="default" data-size="sm" data-act="addUser" ${busy ? 'disabled' : ''} style="height:2.1rem"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M5 12h14"></path><path d="M12 5v14"></path></svg>Add user</button>
+    </div>
+    ${userErr ? `<div class="ui-card-content" style="padding:0 16px"><span style="font-size:11.5px;color:var(--destructive)">${esc(userErr)}</span></div>` : ''}
+  </div>
+  <div class="ui-card" style="padding:0;gap:0;overflow:hidden">
+    <table class="ui-table">
+      <thead><tr><th style="padding-left:14px">User</th><th>Role</th><th>Added</th><th style="width:40px"></th></tr></thead>
+      <tbody>
+        ${list(users).map((u, $index) => `
+          <tr data-email="${esc(u.email)}" data-act="openUser" style="cursor:pointer">
+            <td style="padding-left:14px">
+              <div style="display:flex;align-items:center;gap:9px">
+                <span class="ui-avatar" data-size="sm" style="background:var(--muted);font-size:10px;font-weight:600">${esc(u.initials)}</span>
+                <div style="display:flex;flex-direction:column;gap:1px">
+                  <span style="font-size:12.5px;font-weight:500">${esc(u.name)}</span>
+                  <span style="font-size:11px;color:var(--muted-foreground)">${esc(u.email)}</span>
+                </div>
+              </div>
+            </td>
+            <td><span class="ui-badge" data-variant="${esc(u.badge)}" style="font-size:10px">${esc(u.role)}</span></td>
+            <td style="font-size:12px;color:var(--muted-foreground)">${esc(u.added)}</td>
+            <td>
+              <button class="ui-btn" data-variant="ghost" data-size="icon-sm" data-email="${esc(u.email)}" data-act="rmUser" title="Remove access"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="pointer-events:none"><path d="M3 6h18"></path><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6"></path><path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path><line x1="10" x2="10" y1="11" y2="17"></line><line x1="14" x2="14" y1="11" y2="17"></line></svg></button>
+            </td>
+          </tr>
+        `).join('')}
+      </tbody>
+    </table>
+  </div>
+  <span style="font-size:11px;color:var(--muted-foreground)">Identity is resolved server-side per request; the client never asserts a role. Multiple managers are allowed.</span>
+</div>`;
+}
+
+/** Edit-user slide-over */
+function viewUserPanel(v) {
+  const { busy, roleOptions, userDraft, userDraftAdded, userDraftErr, userDraftInitials } = v;
+  return `<div data-act="closeUserPanel" style="position:absolute;inset:0;background:oklch(0 0 0 / 0.32);z-index:40;animation:fadeIn .15s ease"></div>
+<div style="position:absolute;top:0;right:0;bottom:0;width:380px;background:var(--card);border-left:1px solid var(--border);box-shadow:var(--shadow-lg);z-index:50;display:flex;flex-direction:column;animation:panelIn .18s ease">
+  <div style="display:flex;align-items:center;gap:10px;padding:12px 16px;border-bottom:1px solid var(--border);flex-shrink:0">
+    <span class="ui-avatar" style="background:var(--muted);font-size:11px;font-weight:600">${esc(userDraftInitials)}</span>
+    <div style="display:flex;flex-direction:column;gap:1px;min-width:0">
+      <span style="font-size:13px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">Edit user</span>
+      <span style="font-size:10.5px;color:var(--muted-foreground)">added ${esc(userDraftAdded)}</span>
+    </div>
+    <div style="flex:1"></div>
+    <button class="ui-btn" data-variant="ghost" data-size="icon-sm" data-act="closeUserPanel"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" style="pointer-events:none"><path d="M18 6 6 18"></path><path d="m6 6 12 12"></path></svg></button>
+  </div>
+  <div style="flex:1;overflow-y:auto;padding:16px;display:flex;flex-direction:column;gap:14px">
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px">
+      <div style="display:flex;flex-direction:column;gap:5px">
+        <label class="ui-label" style="font-size:11.5px">First name</label>
+        <input class="ui-input" data-key="first" value="${esc(userDraft.first)}" data-chg="onUserDraft" style="width:100%;min-width:0;box-sizing:border-box;height:2.1rem;font-size:12.5px">
+      </div>
+      <div style="display:flex;flex-direction:column;gap:5px">
+        <label class="ui-label" style="font-size:11.5px">Last name</label>
+        <input class="ui-input" data-key="last" value="${esc(userDraft.last)}" data-chg="onUserDraft" style="width:100%;min-width:0;box-sizing:border-box;height:2.1rem;font-size:12.5px">
+      </div>
+    </div>
+    <div style="display:flex;flex-direction:column;gap:5px">
+      <label class="ui-label" style="font-size:11.5px">Email</label>
+      <input class="ui-input" data-key="email" value="${esc(userDraft.email)}" data-chg="onUserDraft" style="width:100%;min-width:0;box-sizing:border-box;height:2.1rem;font-size:12.5px">
+    </div>
+    <div style="display:flex;flex-direction:column;gap:5px">
+      <label class="ui-label" style="font-size:11.5px">Role</label>
+      <select class="ui-select" data-key="role" data-value="${esc(userDraft.role)}" data-chg="onUserDraft" style="width:100%;height:2.1rem;font-size:12.5px">${list(roleOptions).map((o) => `<option value="${esc(o)}">${esc(o)}</option>`).join('')}</select>
+      <span style="font-size:11px;color:var(--muted-foreground)">managers can access all modules; reviewers get program, roster and record editing</span>
+    </div>
+    ${userDraftErr ? `<span style="font-size:11.5px;color:var(--destructive)">${esc(userDraftErr)}</span>` : ''}
+  </div>
+  <div style="display:flex;align-items:center;gap:8px;padding:12px 16px;border-top:1px solid var(--border);flex-shrink:0;background:var(--card)">
+    <button class="ui-btn" data-variant="default" data-size="sm" data-act="saveUserDraft" ${busy ? 'disabled' : ''}>${busy ? 'Saving…' : 'Save user'}</button>
+    <button class="ui-btn" data-variant="outline" data-size="sm" data-act="closeUserPanel">Cancel</button>
+    <div style="flex:1"></div>
+    <button class="ui-btn" data-variant="ghost" data-size="sm" data-act="rmUserFromPanel" style="color:var(--destructive)">Remove access</button>
+  </div>
+</div>`;
+}
+
+/** Record panel slide-over (TP fields + inline LOB table) */
+function viewRecordPanel(v) {
+  const { busy, statusOptions, typeOptions, supplierOptions, infosecOptions, canDelete, deleteArmed, deleteNotArmed, draft, draftErr, draftIsNA, draftNotNA, fwChips, lobRows, panelId, panelMeta, panelTitle, regionChips, regionLeadChips } = v;
+  return `<div data-act="closePanel" style="position:absolute;inset:0;background:oklch(0 0 0 / 0.32);z-index:40;animation:fadeIn .15s ease"></div>
+<div style="position:absolute;top:0;right:0;bottom:0;width:478px;background:var(--card);border-left:1px solid var(--border);box-shadow:var(--shadow-lg);z-index:50;display:flex;flex-direction:column;animation:panelIn .18s ease">
+  <div style="display:flex;align-items:center;gap:10px;padding:12px 16px;border-bottom:1px solid var(--border);flex-shrink:0">
+    <div style="display:flex;flex-direction:column;gap:2px;min-width:0">
+      <span style="font-size:14.5px;font-weight:600;letter-spacing:var(--tracking-tight);white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${esc(panelTitle)}</span>
+      <div style="display:flex;align-items:center;gap:6px">
+        <span style="font-family:var(--font-mono);font-size:10.5px;color:var(--muted-foreground)">${esc(panelId)}</span>
+        <span style="font-size:10.5px;color:var(--muted-foreground)">${esc(panelMeta)}</span>
+      </div>
+    </div>
+    <div style="flex:1"></div>
+    <button class="ui-btn" data-variant="ghost" data-size="icon-sm" data-act="closePanel"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M18 6 6 18"></path><path d="m6 6 12 12"></path></svg></button>
+  </div>
+
+  <div style="flex:1;min-height:0;overflow-y:auto;padding:14px 16px;display:flex;flex-direction:column;gap:14px">
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px">
+      <div style="display:flex;flex-direction:column;gap:5px">
+        <label class="ui-label" style="font-size:11.5px">Status</label>
+        <select class="ui-select" data-field="status" data-value="${esc(draft.status)}" data-chg="onDraft" style="width:100%;height:2.1rem;font-size:12.5px">
+          ${list(statusOptions).map((o) => `<option value="${esc(o)}">${esc(o)}</option>`).join('')}
+        </select>
+      </div>
+      <div style="display:flex;flex-direction:column;gap:5px">
+        <label class="ui-label" style="font-size:11.5px">Assessment month</label>
+        <input class="ui-input" type="month" data-field="assessment_month_year" value="${esc(draft.assessment_month_year)}" data-chg="onDraft" style="width:100%;min-width:0;box-sizing:border-box;height:2.1rem;font-size:12.5px">
+      </div>
+      <div style="display:flex;flex-direction:column;gap:5px">
+        <label class="ui-label" style="font-size:11.5px">VRA number</label>
+        <input class="ui-input" data-field="vra_number" value="${esc(draft.vra_number)}" data-chg="onDraft" style="width:100%;min-width:0;box-sizing:border-box;height:2.1rem;font-size:12.5px;font-family:var(--font-mono)">
+      </div>
+      <div style="display:flex;flex-direction:column;gap:5px">
+        <label class="ui-label" style="font-size:11.5px">Completed date</label>
+        <input class="ui-input" type="date" data-field="completed_date" value="${esc(draft.completed_date)}" data-chg="onDraft" style="width:100%;min-width:0;box-sizing:border-box;height:2.1rem;font-size:12.5px">
+      </div>
+    </div>
+
+    ${draftIsNA ? `
+      <div style="display:flex;flex-direction:column;gap:8px;padding:12px;border:1px solid var(--border);border-radius:var(--radius-lg);background:var(--muted)">
+        <div style="display:flex;flex-direction:column;gap:2px">
+          <div style="font-size:12.5px;font-weight:500;line-height:1.3">No active business relationship</div>
+          <div style="font-size:11.5px;color:var(--muted-foreground);line-height:1.4">Excluded from this cycle; retained in the universe. Log the discovery findings below.</div>
+        </div>
+        <label class="ui-label" style="font-size:11.5px">Discovery log</label>
+        <textarea class="ui-textarea" data-field="notes"  data-chg="onDraft" rows="5" placeholder="Contract end date, last known activity, finding rationale…" style="width:100%;min-width:0;box-sizing:border-box;font-size:12.5px;background:var(--background)">${esc(draft.notes)}</textarea>
+      </div>
+    ` : ''}
+
+    <div style="display:flex;flex-direction:column;gap:9px">
+      <span style="font-size:11px;font-weight:600;color:var(--muted-foreground);text-transform:uppercase;letter-spacing:.04em">Profile</span>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px">
+        <div style="display:flex;flex-direction:column;gap:5px"><label class="ui-label" style="font-size:11.5px">Name</label><input class="ui-input" data-field="name" value="${esc(draft.name)}" data-chg="onDraft" style="width:100%;min-width:0;box-sizing:border-box;height:2.1rem;font-size:12.5px"></div>
+        <div style="display:flex;flex-direction:column;gap:5px"><label class="ui-label" style="font-size:11.5px">Alternate name</label><input class="ui-input" data-field="alternate_name" value="${esc(draft.alternate_name)}" data-chg="onDraft" style="width:100%;min-width:0;box-sizing:border-box;height:2.1rem;font-size:12.5px"></div>
+      </div>
+      ${draftErr ? `<span style="font-size:11.5px;color:var(--destructive)">${esc(draftErr)}</span>` : ''}
+      <div style="display:grid;grid-template-columns:2fr 1fr;gap:10px">
+        <div style="display:flex;flex-direction:column;gap:5px"><label class="ui-label" style="font-size:11.5px">Locations</label><input class="ui-input" data-field="tp_locations" value="${esc(draft.tp_locations)}" data-chg="onDraft" placeholder="comma-separated" style="width:100%;min-width:0;box-sizing:border-box;height:2.1rem;font-size:12.5px"></div>
+        <div style="display:flex;flex-direction:column;gap:5px"><label class="ui-label" style="font-size:11.5px">Headcount</label><input class="ui-input" type="number" data-field="headcount" value="${esc(draft.headcount)}" data-chg="onDraft" style="width:100%;min-width:0;box-sizing:border-box;height:2.1rem;font-size:12.5px"></div>
+      </div>
+    </div>
+
+    <div style="display:flex;flex-direction:column;gap:9px">
+      <span style="font-size:11px;font-weight:600;color:var(--muted-foreground);text-transform:uppercase;letter-spacing:.04em">Ownership</span>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px">
+        <div style="display:flex;flex-direction:column;gap:5px"><label class="ui-label" style="font-size:11.5px">Business owner</label><input class="ui-input" data-field="business_owner" value="${esc(draft.business_owner)}" data-chg="onDraft" placeholder="internal sponsor" style="width:100%;min-width:0;box-sizing:border-box;height:2.1rem;font-size:12.5px"></div>
+        <div style="display:flex;flex-direction:column;gap:5px"><label class="ui-label" style="font-size:11.5px">Lead reviewer</label><input class="ui-input" data-field="lead_reviewer" value="${esc(draft.lead_reviewer)}" data-chg="onDraft" style="width:100%;min-width:0;box-sizing:border-box;height:2.1rem;font-size:12.5px"></div>
+      </div>
+      <div style="display:flex;flex-direction:column;gap:5px"><label class="ui-label" style="font-size:11.5px">Regions</label>
+        <div style="display:flex;flex-wrap:wrap;gap:6px">
+          ${list(regionChips).map((c, $index) => `
+            <button data-region="${esc(c.name)}" data-act="toggleRegion" style="font-size:11px;font-weight:500;padding:4px 10px;border-radius:var(--radius-full);cursor:pointer;transition:all .15s;border:1px solid ${esc(c.bc)};background:${esc(c.bg)};color:${esc(c.fg)}">${esc(c.name)}</button>
+          `).join('')}
+        </div>
+      </div>
+      <div style="display:flex;flex-direction:column;gap:5px"><label class="ui-label" style="font-size:11.5px">Region lead <span style="font-weight:400;color:var(--muted-foreground)">· pick one</span></label>
+        <div style="display:flex;flex-wrap:wrap;gap:6px">
+          ${list(regionLeadChips).map((c, $index) => `
+            <button data-region="${esc(c.name)}" data-act="pickRegionLead" style="font-size:11px;font-weight:500;padding:4px 10px;border-radius:var(--radius-full);cursor:pointer;transition:all .15s;border:1px solid ${esc(c.bc)};background:${esc(c.bg)};color:${esc(c.fg)}">${esc(c.name)}</button>
+          `).join('')}
+        </div>
+      </div>
+    </div>
+
+    <div style="display:flex;flex-direction:column;gap:9px">
+      <span style="font-size:11px;font-weight:600;color:var(--muted-foreground);text-transform:uppercase;letter-spacing:.04em">Assessment</span>
+      <div style="display:grid;grid-template-columns:1.3fr 1fr 0.8fr;gap:10px">
+        <div style="display:flex;flex-direction:column;gap:5px;min-width:0"><label class="ui-label" style="font-size:11.5px">Assessment type</label>
+          <select class="ui-select" data-field="assessment_type" data-value="${esc(draft.assessment_type)}" data-chg="onDraft" style="width:100%;min-width:0;height:2.1rem;font-size:12.5px">${list(typeOptions).map((o) => `<option value="${esc(o)}">${esc(o)}</option>`).join('')}</select>
+        </div>
+        <div style="display:flex;flex-direction:column;gap:5px;min-width:0"><label class="ui-label" style="font-size:11.5px">Supplier type</label>
+          <select class="ui-select" data-field="supplier_type" data-value="${esc(draft.supplier_type || '')}" data-chg="onDraft" style="width:100%;min-width:0;height:2.1rem;font-size:12.5px"><option value="">—</option>${list(supplierOptions).map((o) => `<option value="${esc(o)}">${esc(o)}</option>`).join('')}</select>
+        </div>
+        <div style="display:flex;flex-direction:column;gap:5px;min-width:0"><label class="ui-label" style="font-size:11.5px">InfoSec version</label>
+          <select class="ui-select" data-field="infosec_version" data-value="${esc(draft.infosec_version || '')}" data-chg="onDraft" style="width:100%;min-width:0;height:2.1rem;font-size:12.5px"><option value="">—</option>${list(infosecOptions).map((o) => `<option value="${esc(o)}">${esc(o)}</option>`).join('')}</select>
+        </div>
+      </div>
+      <label class="ui-label" style="font-size:11.5px">Applicable frameworks</label>
+      <div style="display:flex;flex-wrap:wrap;gap:6px">
+        ${list(fwChips).map((c, $index) => `
+          <button data-fw="${esc(c.name)}" data-act="toggleFw" style="font-size:11px;font-weight:500;padding:4px 10px;border-radius:var(--radius-full);cursor:pointer;transition:all .15s;border:1px solid ${esc(c.bc)};background:${esc(c.bg)};color:${esc(c.fg)}">${esc(c.name)}</button>
+        `).join('')}
+      </div>
+    </div>
+
+    <div style="display:flex;flex-direction:column;gap:9px">
+      <div style="display:flex;align-items:center">
+        <span style="font-size:11px;font-weight:600;color:var(--muted-foreground);text-transform:uppercase;letter-spacing:.04em">Lines of business</span>
+        <div style="flex:1"></div>
+        <button class="ui-btn" data-variant="outline" data-size="xs" data-act="addLob" style="color:var(--foreground);background:var(--background)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M5 12h14"></path><path d="M12 5v14"></path></svg>Add LOB</button>
+      </div>
+      <div style="display:grid;grid-template-columns:1fr 1.35fr 1fr 28px;gap:6px;font-size:10.5px;color:var(--muted-foreground)">
+        <span>Line of business</span><span>Service description</span><span>Vendor manager</span><span></span>
+      </div>
+      ${list(lobRows).map((l, $index) => `
+        <div style="display:grid;grid-template-columns:1fr 1.35fr 1fr 28px;gap:6px;align-items:center">
+          <input class="ui-input" data-idx="${esc($index)}" data-field="line_of_business" value="${esc(l.line_of_business)}" data-chg="onLob" style="width:100%;min-width:0;box-sizing:border-box;height:1.9rem;font-size:11.5px;padding:0 8px">
+          <input class="ui-input" data-idx="${esc($index)}" data-field="service_description" value="${esc(l.service_description)}" data-chg="onLob" style="width:100%;min-width:0;box-sizing:border-box;height:1.9rem;font-size:11.5px;padding:0 8px">
+          <input class="ui-input" data-idx="${esc($index)}" data-field="vendor_manager" value="${esc(l.vendor_manager)}" data-chg="onLob" style="width:100%;min-width:0;box-sizing:border-box;height:1.9rem;font-size:11.5px;padding:0 8px">
+          <button class="ui-btn" data-variant="ghost" data-size="icon-sm" data-idx="${esc($index)}" data-act="rmLob" style="width:1.8rem;height:1.8rem"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" style="pointer-events:none;width:.85rem;height:.85rem"><path d="M18 6 6 18"></path><path d="m6 6 12 12"></path></svg></button>
+        </div>
+      `).join('')}
+    </div>
+
+    ${draftNotNA ? `
+      <div style="display:flex;flex-direction:column;gap:5px">
+        <label class="ui-label" style="font-size:11.5px">Notes</label>
+        <textarea class="ui-textarea" data-field="notes"  data-chg="onDraft" rows="3" placeholder="Context, scope notes, scheduling constraints…" style="width:100%;min-width:0;box-sizing:border-box;font-size:12.5px">${esc(draft.notes)}</textarea>
+      </div>
+    ` : ''}
+  </div>
+
+  <div style="display:flex;align-items:center;gap:8px;padding:12px 16px;border-top:1px solid var(--border);flex-shrink:0;background:var(--card)">
+    <button class="ui-btn" data-variant="default" data-size="sm" data-act="saveDraft" ${busy ? 'disabled' : ''}>${busy ? 'Saving…' : 'Save record'}</button>
+    <button class="ui-btn" data-variant="outline" data-size="sm" data-act="closePanel" style="color:var(--foreground);background:var(--background)">Cancel</button>
+    <div style="flex:1"></div>
+    ${canDelete ? `
+      ${deleteArmed ? `
+        <span style="font-size:11.5px;color:var(--destructive)">Delete record and its LOBs?</span>
+        <button class="ui-btn" data-variant="destructive" data-size="sm" data-act="doDelete" ${busy ? 'disabled' : ''}>Confirm</button>
+        <button class="ui-btn" data-variant="ghost" data-size="sm" data-act="armDelete" style="color:var(--foreground)">Keep</button>
+      ` : ''}
+      ${deleteNotArmed ? `
+        <button class="ui-btn" data-variant="ghost" data-size="sm" data-act="armDelete" style="color:var(--destructive)">Delete</button>
+      ` : ''}
+    ` : ''}
+  </div>
+</div>`;
+}
+
+/** Toast */
+function viewToast(v) {
+  const { savedMsg } = v;
+  return `<div style="position:absolute;top:14px;left:50%;transform:translateX(-50%);z-index:60;background:var(--foreground);color:var(--background);font-size:12px;font-weight:500;padding:7px 14px;border-radius:var(--radius-full);box-shadow:var(--shadow-md);animation:fadeIn .15s ease">${esc(savedMsg)}</div>`;
+}
+
+
+/* =====================================================================================================
+ * 10. EVENT HANDLERS — H[name](element, event). Markup binds them with data-act / data-chg.
+ *     Every server call goes through api(), which resolves {success,data|error} and never throws.
+ * ===================================================================================================== */
+const resetScroll = () => { const m = document.getElementById('main-scroll'); if (m) m.scrollTop = 0; };
+const isManagerNow = () => !!S.me && S.me.role === 'Manager';
+
+/* ---- shell ------------------------------------------------------------------------------------------ */
+H.setView = (el) => {
+  const view = el.getAttribute('data-view');
+  if (!VIEW_TITLES[view] || !viewAllowed(view)) return;
+  setState({ view });
+  resetScroll();
+};
+H.setRole = (el) => {
+  if (!isManagerNow()) return; // only a real Manager may preview the Reviewer experience; the server still enforces the real role
+  const viewAs = el.getAttribute('data-role') === 'Reviewer' ? 'Reviewer' : 'Manager';
+  const patch = { viewAs };
+  if (viewAs !== 'Manager') { patch.userPanelOpen = false; patch.userDraft = null; }
+  Object.assign(S, patch);
+  if (!viewAllowed(S.view)) S.view = 'exec';
+  render();
+};
+H.toggleDark = () => { store('tprm.dark', S.dark ? '0' : '1'); setState({ dark: !S.dark }); };
+H.setYear = (el) => setState({ year: parseInt(el.value, 10) || S.year });
+H.retryBoot = () => boot();
+
+/* ---- roster filters / sorting ----------------------------------------------------------------------- */
+H.onFilter = (el) => {
+  const key = el.getAttribute('data-key');
+  if (!(key in S.filters)) return;
+  S.filters = Object.assign({}, S.filters, { [key]: el.value });
+  render();
+};
+H.clearFilters = () => setState({ filters: { q: '', status: 'All statuses', region: 'All regions', owner: 'All owners', fw: 'All frameworks' } });
+H.sortBy = (el) => {
+  const key = el.getAttribute('data-key');
+  setState({ sort: { key, dir: S.sort.key === key ? -S.sort.dir : 1 } });
+};
+
+/* ---- third-party record panel ----------------------------------------------------------------------- */
+const blankLob = () => ({ lob_id: '', line_of_business: '', service_description: '', vendor_manager: '' });
+function closeRecordPanel() { setState({ panelOpen: false, draft: null, draftErr: '', deleteArmed: false, busy: false }); }
+
+H.openTp = (el) => {
+  const id = el.getAttribute('data-id');
+  const tp = S.tps.filter((t) => t.tp_id === id)[0];
+  if (!tp) return;
+  const lobs = S.lobs.filter((l) => l.tp_id === id).map(clone);
+  setState({ panelOpen: true, draft: Object.assign(clone(tp), { lobs: lobs.length ? lobs : [blankLob()] }), draftErr: '', deleteArmed: false });
+};
+H.newTp = () => setState({ panelOpen: true, draft: newDraft(), draftErr: '', deleteArmed: false });
+H.closePanel = () => { if (!S.busy) closeRecordPanel(); };
+H.onDraft = (el) => {
+  if (!S.draft) return;
+  S.draft[el.getAttribute('data-field')] = el.value;
+  S.draftErr = '';
+  render();
+};
+function toggleInList(current, value, order) {
+  const set = splitList(current);
+  const at = set.indexOf(value);
+  if (at >= 0) set.splice(at, 1); else set.push(value);
+  const rank = (x) => { const i = order.indexOf(x); return i < 0 ? 999 : i; };
+  return set.sort((a, b) => rank(a) - rank(b)).join(', ');
+}
+H.pickRegionLead = (el) => {
+  if (!S.draft) return;
+  const r = el.getAttribute('data-region');
+  S.draft.region_lead = S.draft.region_lead === r ? '' : r; // click again to clear
+  S.draftErr = '';
+  render();
+};
+H.toggleRegion = (el) => {
+  if (!S.draft) return;
+  S.draft.regions = toggleInList(S.draft.regions, el.getAttribute('data-region'), S.cfg.region);
+  S.draftErr = '';
+  render();
+};
+H.toggleFw = (el) => {
+  if (!S.draft) return;
+  S.draft.applicable_frameworks = toggleInList(S.draft.applicable_frameworks, el.getAttribute('data-fw'), S.cfg.framework);
+  S.draftErr = '';
+  render();
+};
+H.onLob = (el) => {
+  if (!S.draft) return;
+  const l = S.draft.lobs[parseInt(el.getAttribute('data-idx'), 10)];
+  if (l) l[el.getAttribute('data-field')] = el.value;
+  render();
+};
+H.addLob = () => { if (S.draft) { S.draft.lobs.push(blankLob()); render(); } };
+H.rmLob = (el) => {
+  if (!S.draft) return;
+  S.draft.lobs.splice(parseInt(el.getAttribute('data-idx'), 10), 1);
+  render();
+};
+
+H.saveDraft = async () => {
+  const d = S.draft;
+  if (!d || S.busy) return;
+  if (!String(d.name || '').trim()) return setState({ draftErr: 'Name is required.' });
+  if (d.assessment_month_year && !/^\d{4}-(0[1-9]|1[0-2])$/.test(d.assessment_month_year)) return setState({ draftErr: 'Assessment month must look like YYYY-MM.' });
+  if (d.completed_date && !/^\d{4}-\d{2}-\d{2}$/.test(d.completed_date)) return setState({ draftErr: 'Completed date must look like YYYY-MM-DD.' });
+  setState({ busy: true, draftErr: '' });
+  const tp = clone(d);
+  const lobs = list(tp.lobs);
+  delete tp.lobs;
+  const res = await api('saveThirdPartyWithLobs', tp, lobs);
+  if (!res.success) return setState({ busy: false, draftErr: res.error });
+  const saved = res.data.tp;
+  const exists = S.tps.some((t) => t.tp_id === saved.tp_id);
+  S.tps = exists ? S.tps.map((t) => (t.tp_id === saved.tp_id ? saved : t)) : S.tps.concat([saved]);
+  S.lobs = S.lobs.filter((l) => l.tp_id !== saved.tp_id).concat(list(res.data.lobs));
+  S.tpsStamp++;
+  closeRecordPanel();
+  flash((exists ? 'Saved ' : 'Added ') + saved.name);
+};
+H.armDelete = () => { if (isManagerNow() && S.draft && S.draft.tp_id) setState({ deleteArmed: !S.deleteArmed }); };
+H.doDelete = async () => {
+  const d = S.draft;
+  if (!d || !d.tp_id || S.busy) return;
+  setState({ busy: true, draftErr: '' });
+  const res = await api('deleteThirdPartyWithLobs', d.tp_id);
+  if (!res.success) return setState({ busy: false, deleteArmed: false, draftErr: res.error });
+  S.tps = S.tps.filter((t) => t.tp_id !== d.tp_id);
+  S.lobs = S.lobs.filter((l) => l.tp_id !== d.tp_id);
+  S.tpsStamp++;
+  const name = d.name;
+  closeRecordPanel();
+  flash('Deleted ' + name);
+};
+
+/* ---- user management (Manager only — the server re-checks every call) ------------------------------- */
+H.onNewUser = (el) => {
+  const k = { first: 'newUserFirst', last: 'newUserLast', email: 'newUserEmail', role: 'newUserRole' }[el.getAttribute('data-key')];
+  if (!k) return;
+  S[k] = el.value;
+  S.userErr = '';
+  render();
+};
+const userFormError = (u) => {
+  if (!String(u.first || '').trim() || !String(u.last || '').trim()) return 'First and last name are required.';
+  if (!emailRe.test(String(u.email || '').trim())) return 'Enter a valid email address.';
+  return '';
+};
+// Removing yourself ends your own access, so the app is re-booted (it will show the access screen).
+const afterUserChange = (touchedEmail) => {
+  if (S.me && touchedEmail && touchedEmail.toLowerCase() === S.me.email.toLowerCase()) boot();
+};
+H.addUser = async () => {
+  if (S.busy) return;
+  const u = { first: S.newUserFirst, last: S.newUserLast, email: S.newUserEmail, role: S.newUserRole };
+  const err = userFormError(u);
+  if (err) return setState({ userErr: err });
+  setState({ busy: true, userErr: '' });
+  const res = await api('addUser', u);
+  if (!res.success) return setState({ busy: false, userErr: res.error });
+  setState({ busy: false, users: res.data, newUserFirst: '', newUserLast: '', newUserEmail: '', newUserRole: 'Reviewer' });
+  flash('Added ' + u.email.trim().toLowerCase());
+};
+H.rmUser = async (el) => {
+  const email = el.getAttribute('data-email');
+  if (S.busy || !email) return;
+  setState({ busy: true, userErr: '' });
+  const res = await api('removeUser', email);
+  if (!res.success) return setState({ busy: false, userErr: res.error });
+  setState({ busy: false, users: res.data });
+  flash('Removed ' + email);
+  afterUserChange(email);
+};
+H.openUser = (el) => {
+  const u = S.users.filter((x) => x.email === el.getAttribute('data-email'))[0];
+  if (!u) return;
+  setState({ userPanelOpen: true, userDraft: Object.assign(clone(u), { origEmail: u.email }), userDraftErr: '' });
+};
+H.closeUserPanel = () => { if (!S.busy) setState({ userPanelOpen: false, userDraft: null, userDraftErr: '' }); };
+H.onUserDraft = (el) => {
+  if (!S.userDraft) return;
+  S.userDraft[el.getAttribute('data-key')] = el.value;
+  S.userDraftErr = '';
+  render();
+};
+H.saveUserDraft = async () => {
+  const u = S.userDraft;
+  if (!u || S.busy) return;
+  const err = userFormError(u);
+  if (err) return setState({ userDraftErr: err });
+  setState({ busy: true, userDraftErr: '' });
+  const res = await api('updateUser', u.origEmail, { first: u.first, last: u.last, email: u.email, role: u.role });
+  if (!res.success) return setState({ busy: false, userDraftErr: res.error });
+  setState({ busy: false, users: res.data, userPanelOpen: false, userDraft: null });
+  flash('Saved ' + u.email.trim().toLowerCase());
+  afterUserChange(u.origEmail);
+};
+H.rmUserFromPanel = async () => {
+  const u = S.userDraft;
+  if (!u || S.busy) return;
+  setState({ busy: true, userDraftErr: '' });
+  const res = await api('removeUser', u.origEmail);
+  if (!res.success) return setState({ busy: false, userDraftErr: res.error });
+  setState({ busy: false, users: res.data, userPanelOpen: false, userDraft: null });
+  flash('Removed ' + u.origEmail);
+  afterUserChange(u.origEmail);
+};
+
+/* =====================================================================================================
+ * 11. BOOT — one getInitialData() call resolves identity (server-side), dropdown values and data.
+ * ===================================================================================================== */
+async function boot() {
+  setState({ boot: 'loading', bootError: '' });
+  const res = await api('getInitialData');
+  if (res.success) {
+    applyAppData(res.data);
+    S.boot = 'ready';
+  } else if (res.error === 'Unauthorized') {
+    S.boot = 'denied';
+  } else {
+    S.boot = 'error';
+    S.bootError = res.error || 'Unknown error.';
+  }
+  render();
+}
+
+/** Background refresh so a long-open tab sees other people's edits. Never interrupts editing. */
+async function refreshData() {
+  const busy = S.panelOpen || S.userPanelOpen || S.busy;
+  if (S.boot !== 'ready' || busy || document.hidden) return;
+  const res = await api('getInitialData');
+  if (!res.success) return;
+  if (S.panelOpen || S.userPanelOpen || S.busy) return; // the user opened something while we were waiting
+  applyAppData(res.data);
+  render();
+}
+
+function init() {
+  appEl = document.getElementById('app');
+  if (!appEl) return;
+  updateScale();
+  window.addEventListener('resize', () => { updateScale(); render(); });
+  bindEvents(appEl);
+
+  document.addEventListener('keydown', (e) => {
+    if (e.key !== 'Escape' || S.busy) return;
+    if (S.userPanelOpen) H.closeUserPanel();
+    else if (S.panelOpen) H.closePanel();
+  });
+  document.addEventListener('visibilitychange', () => { if (!document.hidden && Date.now() - S.loadedAt > AUTO_REFRESH_MS) refreshData(); });
+  setInterval(() => { if (Date.now() - S.loadedAt > AUTO_REFRESH_MS) refreshData(); }, AUTO_REFRESH_MS);
+
+  render();
+  boot();
+}
+if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init); else init();
+
+})();
+</script>
